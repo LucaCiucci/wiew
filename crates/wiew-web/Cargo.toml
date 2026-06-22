@@ -1,0 +1,15 @@
+[package]
+name = "wiew-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wiew = { path = "../wiew", features = ["egui"] }
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.34"
+log = "0.4"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+console_error_panic_hook = "0.1"
+ply-rs = "0.1.3"

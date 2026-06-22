@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wiew",
+    "crates/wiew-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+rotation3 = { git = "https://github.com/LucaCiucci/rotation3", version = "0.1.0" }
+wgpu = "29"
+
