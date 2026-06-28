@@ -33,7 +33,7 @@ pub fn load_ply_xz(compressed: &[u8]) -> Result<(), JsValue> {
     let (positions, normals, colors) = parse_ply(&ply_bytes)?;
 
     // 3. Build LOD tree
-    let lod = PcLod::from_streams(
+    let lod = PcLod::from_points(
         positions,
         normals,
         colors,

@@ -16,49 +16,13 @@ use crate::{
     provided::pipelines::{ColoredSplatPipeline, FlatPipeline, LitMaterial},
 };
 
-const LEAF_LOD_TARGETS: [usize; 5] = [512, 2_048, 8_192, 32_768, 131_072];
-const NODE_LOD_TARGETS: [usize; 3] = [512, 2_048, 8_192];
+mod config;
+mod point;
 
-#[derive(Debug, Clone)]
-pub struct PcLodConfig {
-    /// Stop splitting once a node reaches this depth.
-    pub max_depth: u32,
-    /// Stop splitting once a node contains at most this many points.
-    pub leaf_point_count: usize,
-    /// Render a node representative when its projected diameter is below this
-    /// threshold. Larger nodes descend into children or leaf chunks.
-    pub proxy_diameter_px: f32,
-    /// Desired point density for selected leaf chunks. Higher values draw more
-    /// points per screen pixel; lower values favor coarser leaf payloads.
-    pub points_per_pixel: f32,
-    /// Maximum point count for internal multi-point proxies.
-    pub node_lod_point_count: usize,
-}
-
-impl Default for PcLodConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: 10,
-            leaf_point_count: 32_768,
-            proxy_diameter_px: 2.5,
-            points_per_pixel: 0.05,
-            node_lod_point_count: 8_192,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PcLodPoint {
-    pub position: Position,
-    pub normal: Normal,
-    pub color: Color,
-}
+pub use config::*;
+pub use point::*;
 
 /// Hierarchical point-cloud renderer.
-///
-/// The current implementation is intentionally simple: tree selection runs on
-/// the CPU each frame, selected proxy surfels are copied into one dynamic mesh,
-/// and selected leaf chunks are drawn with the existing colored splat pipeline.
 pub struct PcLod {
     config: PcLodConfig,
     nodes: Vec<PcLodNode>,
@@ -110,30 +74,16 @@ impl PcLod {
         }
     }
 
+    /// A convenience constructor for building a [`PcLod`] from separate point streams.
+    ///
+    /// This simply combines [`PcLodPoint::from_streams`] and [`PcLod::from_points`].
     pub fn from_streams(
         positions: Vec<Position>,
         normals: Vec<Normal>,
         colors: Vec<Color>,
         config: PcLodConfig,
     ) -> Result<Self, PcLodBuildError> {
-        if positions.len() != normals.len() || positions.len() != colors.len() {
-            return Err(PcLodBuildError::LengthMismatch {
-                positions: positions.len(),
-                normals: normals.len(),
-                colors: colors.len(),
-            });
-        }
-
-        let points = positions
-            .into_iter()
-            .zip(normals)
-            .zip(colors)
-            .map(|((position, normal), color)| PcLodPoint {
-                position,
-                normal,
-                color,
-            })
-            .collect();
+        let points = PcLodPoint::from_streams(positions, normals, colors)?.collect();
         Ok(Self::from_points(points, config))
     }
 

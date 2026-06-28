@@ -16,7 +16,7 @@ use wiew::{
     egui_view::EguiView3d,
     mesh::{Color, Mesh, Normal, Position},
     provided::{
-        Grid, PcLod, PcLodConfig, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
+        Grid, PcLod, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
         pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
     },
 };
@@ -542,13 +542,7 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
         positions,
         normals,
         colors,
-        PcLodConfig {
-            leaf_point_count: 65_536 / 64,
-            proxy_diameter_px: 2.5,
-            points_per_pixel: 1.05,
-            node_lod_point_count: 8_192,
-            max_depth: 14,
-        },
+        Default::default(),
     )?;
     Ok(LoadedPointCloudLod { lod, point_count })
 }
