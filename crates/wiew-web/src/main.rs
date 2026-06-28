@@ -25,7 +25,7 @@ use wiew::{
     egui_view::EguiView3d,
     mesh::{Color, Mesh, Normal, Position},
     provided::{
-        Grid, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
+        Grid, PcLod, PcLodConfig, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
         pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
     },
 };
@@ -86,8 +86,8 @@ impl App {
             EguiView3d::new(device, queue, 900, 600, 5.0).with_texture_name("wiew web scene");
 
         let point_cloud = load_embedded_points();
-        let ply_mesh = load_ply_points();
-        let scene = Scene::new(point_cloud, ply_mesh);
+        let ply_lod = load_ply_points();
+        let scene = Scene::new(point_cloud, ply_lod);
 
         Self {
             view,
@@ -127,6 +127,8 @@ impl eframe::App for App {
                     &mut self.scene.point_material,
                     &mut self.scene.point_colored_material,
                 );
+                ui.separator();
+                lod_ui(ui, &mut self.scene.ply_lod);
             });
 
         let desired = self.view.central_panel_interactive(ui, tex_id);
@@ -137,6 +139,88 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 // Material UI
 // ---------------------------------------------------------------------------
+
+fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
+    ui.heading("PLY LOD");
+    let mut draw_bounds = lod.draw_bounds();
+    if ui
+        .checkbox(&mut draw_bounds, "Draw selected boxes")
+        .changed()
+    {
+        lod.set_draw_bounds(draw_bounds);
+    }
+
+    let mut proxy_diameter_px = lod.config().proxy_diameter_px;
+    if ui
+        .add(
+            egui::Slider::new(&mut proxy_diameter_px, 0.5..=128.0)
+                .logarithmic(true)
+                .text("Proxy px"),
+        )
+        .changed()
+    {
+        lod.config_mut().proxy_diameter_px = proxy_diameter_px;
+    }
+
+    let mut points_per_pixel = lod.config().points_per_pixel;
+    if ui
+        .add(
+            egui::Slider::new(&mut points_per_pixel, 0.001..=5.0)
+                .logarithmic(true)
+                .text("Pts/px"),
+        )
+        .changed()
+    {
+        lod.config_mut().points_per_pixel = points_per_pixel;
+    }
+
+    let stats = lod.stats();
+    let drawn = stats.drawn_points();
+    let percent = if stats.total_points > 0 {
+        drawn as f64 * 100.0 / stats.total_points as f64
+    } else {
+        0.0
+    };
+
+    egui::Grid::new("pc_lod_stats")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Tree");
+            ui.label(format!(
+                "{} nodes / {} leaves",
+                stats.total_nodes, stats.total_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Visited");
+            ui.label(format!(
+                "{} nodes ({} culled)",
+                stats.visited_nodes, stats.culled_nodes
+            ));
+            ui.end_row();
+
+            ui.label("Selected");
+            ui.label(format!(
+                "{} proxies / {} leaves",
+                stats.selected_proxy_points, stats.selected_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Leaf LOD");
+            ui.label(format!(
+                "{} coarse / {} full",
+                stats.selected_leaf_lod_chunks, stats.selected_full_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Drawn");
+            ui.label(format!(
+                "{} / {} pts ({percent:.1}%)",
+                drawn, stats.total_points
+            ));
+            ui.end_row();
+        });
+}
 
 fn material_ui(
     ui: &mut egui::Ui,
@@ -235,26 +319,21 @@ struct Scene {
     gizmo: TrackballGizmo,
     point_cloud: Mesh,
     point_count: usize,
-    ply_mesh: Mesh,
+    ply_lod: PcLod,
     ply_count: usize,
     point_pipeline: SplatPipeline,
     point_colored_pipeline: ColoredSplatPipeline,
     point_material: LitMaterial,
     point_colored_material: LitMaterial,
-    ply_material: LitMaterial,
 }
 
 impl Scene {
-    fn new(point_cloud: LoadedPointCloud, ply_mesh: LoadedPointCloud) -> Self {
+    fn new(point_cloud: LoadedPointCloud, ply_lod: LoadedPointCloudLod) -> Self {
         let point_count = point_cloud.point_count;
         let point_material = LitMaterial::leios_blue().with_point_size(0.003);
         let point_colored_material = LitMaterial::leios_blue()
             .with_front_color([1.0, 1.0, 1.0, 1.0])
             .with_point_size(0.003);
-        let ply_material = LitMaterial::leios_blue()
-            .with_front_color([1.0, 0.3, 0.3, 1.0]) // reddish to distinguish
-            .with_back_color([0.5, 0.1, 0.1, 1.0])
-            .with_point_size(0.001);
 
         Self {
             bg: QuadBackground::new(QuadBackgroundConfig::default()),
@@ -262,13 +341,12 @@ impl Scene {
             gizmo: TrackballGizmo::new(),
             point_cloud: point_cloud.mesh,
             point_count,
-            ply_mesh: ply_mesh.mesh,
-            ply_count: ply_mesh.point_count,
+            ply_lod: ply_lod.lod,
+            ply_count: ply_lod.point_count,
             point_pipeline: SplatPipeline::new(),
             point_colored_pipeline: ColoredSplatPipeline::new(),
             point_material,
             point_colored_material,
-            ply_material,
         }
     }
 
@@ -290,8 +368,7 @@ impl Scene {
                 &self.point_material,
             );
         }
-        self.point_pipeline
-            .draw_mesh_with_material(cx, pass, &self.ply_mesh, &self.ply_material);
+        pass.draw(cx, &self.ply_lod);
         pass.draw(cx, &self.gizmo);
     }
 }
@@ -302,6 +379,11 @@ impl Scene {
 
 struct LoadedPointCloud {
     mesh: Mesh,
+    point_count: usize,
+}
+
+struct LoadedPointCloudLod {
+    lod: PcLod,
     point_count: usize,
 }
 
@@ -372,14 +454,12 @@ fn load_embedded_points() -> LoadedPointCloud {
 }
 
 // ---------------------------------------------------------------------------
-// PLY file — embedded binary, first 100 vertices only
+// PLY file — binary, loaded directly into flat arrays (no per-vertex overhead)
 // ---------------------------------------------------------------------------
 
-/// Raw bytes of `tot.ply` (binary PLY, ~400 MB of vertices — we only read the
-/// header and first 100 points to keep the Wasm binary sane).
 static PLY_BYTES: &[u8] = include_bytes!("../../../tot_fiori.ply");
 
-fn load_ply_points() -> LoadedPointCloud {
+fn load_ply_points() -> LoadedPointCloudLod {
     // Find the end_header marker (in ASCII, even for binary PLY files).
     let header_end = PLY_BYTES
         .windows(b"end_header\n".len())
@@ -387,14 +467,13 @@ fn load_ply_points() -> LoadedPointCloud {
         .expect("PLY file missing end_header")
         + b"end_header\n".len();
 
-    // Read up to 100 vertices, each is 6 × f32_le = 24 bytes.
-    const VERTEX_STRIDE: usize = 24; // x,y,z,nx,ny,nz as f32_le
-    const MAX_PLY_POINTS: usize = 1000000_000;
+    // Each vertex is 6 × f32_le = 24 bytes (x,y,z,nx,ny,nz).
+    const VERTEX_STRIDE: usize = 24;
     let data = &PLY_BYTES[header_end..];
-    let count = (data.len() / VERTEX_STRIDE).min(MAX_PLY_POINTS);
+    let count = data.len() / VERTEX_STRIDE;
 
-    let mut positions = Vec::<Position>::new();
-    let mut normals = Vec::<Normal>::new();
+    let mut positions = Vec::<Position>::with_capacity(count);
+    let mut normals = Vec::<Normal>::with_capacity(count);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
 
@@ -439,8 +518,21 @@ fn load_ply_points() -> LoadedPointCloud {
     }
 
     let point_count = positions.len();
-    LoadedPointCloud {
-        mesh: Mesh::new(positions).with_normals(normals),
+    let colors = vec![[1.0, 1.0, 1.0, 1.0]; point_count];
+    let lod = PcLod::from_streams(
+        positions,
+        normals,
+        colors,
+        PcLodConfig {
+            leaf_point_count: 65_536,
+            proxy_diameter_px: 2.5,
+            points_per_pixel: 1.05,
+            max_depth: 14,
+        },
+    )
+    .expect("PcLod build failed");
+    LoadedPointCloudLod {
+        lod,
         point_count,
     }
 }

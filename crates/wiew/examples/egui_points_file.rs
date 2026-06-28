@@ -234,7 +234,7 @@ fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
     let mut points_per_pixel = lod.config().points_per_pixel;
     if ui
         .add(
-            egui::Slider::new(&mut points_per_pixel, 0.001..=1.0)
+            egui::Slider::new(&mut points_per_pixel, 0.001..=5.0)
                 .logarithmic(true)
                 .text("Pts/px"),
         )
