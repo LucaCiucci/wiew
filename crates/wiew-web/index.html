@@ -43,11 +43,15 @@
             addEventListener("TrunkApplicationStarted", resolve, { once: true });
         });
 
-        //const resp = await fetch("tot_fiori.ply.xz");
-        //const buf = await resp.arrayBuffer();
-        //window.wasmBindings.load_ply_xz(new Uint8Array(buf));
-
-        window.wasmBindings.load_toys();
+        // If ?ply=... is in the URL, fetch and load the external PLY
+        const plyParam = new URLSearchParams(location.search).get("ply");
+        if (plyParam) {
+            const resp = await fetch(plyParam);
+            const buf = await resp.arrayBuffer();
+            window.wasmBindings.load_ply_xz(new Uint8Array(buf));
+        } else {
+            window.wasmBindings.load_toys();
+        }
     </script>
 </body>
 </html>
