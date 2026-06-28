@@ -54,7 +54,7 @@ impl App {
             EguiView3d::new(device, queue, 900, 600, 5.0).with_texture_name("points file scene");
         let point_cloud =
             load_points_file(&points_file_path()).expect("failed to load points_6.txt");
-        let ply_lod = load_ply_points().expect("failed to load tot.ply");
+        let ply_lod = load_ply_points().expect("failed to load stress-test PLY files");
         let scene = Scene::new(point_cloud, ply_lod);
 
         Self {
@@ -457,67 +457,52 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 // PLY file loader for binary little-endian x y z nx ny nz vertex data.
 // ---------------------------------------------------------------------------
 
-fn ply_file_path() -> PathBuf {
-    //let cwd_path = PathBuf::from("tot.ply");
-    let cwd_path = PathBuf::from("tot_fiori.ply");
-    //let cwd_path = PathBuf::from("punti_fibbia.ply");
-    if cwd_path.exists() {
-        return cwd_path;
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("tot.ply")
+fn ply_file_paths() -> Vec<PathBuf> {
+    ["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
+        .into_iter()
+        .map(|file| {
+            let cwd_path = PathBuf::from(file);
+            if cwd_path.exists() {
+                cwd_path
+            } else {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(file)
+            }
+        })
+        .collect()
 }
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
-    let mut file = File::open(ply_file_path())?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw)?;
-
-    // Find end_header marker (in ASCII, even for binary PLY)
-    let header_end = raw
-        .windows(b"end_header\n".len())
-        .position(|w| w == b"end_header\n")
-        .ok_or("PLY file missing end_header")?
-        + b"end_header\n".len();
-
-    // Read up to 100 vertices, each is 6 × f32_le = 24 bytes
-    const VERTEX_STRIDE: usize = 24;
-    const MAX_PLY_POINTS: usize = 1000_000_00;
-    let data = &raw[header_end..];
-    let count = (data.len() / VERTEX_STRIDE).min(MAX_PLY_POINTS);
-
-    let mut positions = Vec::<Position>::with_capacity(count);
-    let mut normals = Vec::<Normal>::with_capacity(count);
-    let mut colors = Vec::<Color>::with_capacity(count);
+    let mut positions = Vec::<Position>::new();
+    let mut normals = Vec::<Normal>::new();
+    let mut colors = Vec::<Color>::new();
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
+    let mut loaded_files = 0usize;
 
-    for i in 0..count {
-        let offset = i * VERTEX_STRIDE;
-        let chunk = &data[offset..offset + VERTEX_STRIDE];
-
-        let x = f32::from_le_bytes(chunk[0..4].try_into()?);
-        let y = f32::from_le_bytes(chunk[4..8].try_into()?);
-        let z = f32::from_le_bytes(chunk[8..12].try_into()?);
-        let nx = f32::from_le_bytes(chunk[12..16].try_into()?);
-        let ny = f32::from_le_bytes(chunk[16..20].try_into()?);
-        let nz = f32::from_le_bytes(chunk[20..24].try_into()?);
-
-        let position = [x, y, z];
-        let normal = normalize([nx, ny, nz]);
-
-        for axis in 0..3 {
-            min[axis] = min[axis].min(position[axis]);
-            max[axis] = max[axis].max(position[axis]);
+    for path in ply_file_paths() {
+        if !path.exists() {
+            continue;
         }
-        positions.push(position);
-        normals.push(normal);
-        colors.push([1.0, 1.0, 1.0, 1.0]);
+
+        load_one_ply_points(
+            &path,
+            &mut positions,
+            &mut normals,
+            &mut colors,
+            &mut min,
+            &mut max,
+        )?;
+        loaded_files += 1;
+    }
+
+    if loaded_files == 0 {
+        return Err("none of the stress-test PLY files were found".into());
     }
 
     if positions.is_empty() {
-        return Err("PLY file contains no readable points".into());
+        return Err("PLY files contain no readable points".into());
     }
 
     let center = [
@@ -551,6 +536,60 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
         },
     )?;
     Ok(LoadedPointCloudLod { lod, point_count })
+}
+
+fn load_one_ply_points(
+    path: &Path,
+    positions: &mut Vec<Position>,
+    normals: &mut Vec<Normal>,
+    colors: &mut Vec<Color>,
+    min: &mut [f32; 3],
+    max: &mut [f32; 3],
+) -> Result<(), Box<dyn Error>> {
+    let mut file = File::open(path)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+
+    // Find end_header marker (in ASCII, even for binary PLY)
+    let header_end = raw
+        .windows(b"end_header\n".len())
+        .position(|w| w == b"end_header\n")
+        .ok_or_else(|| format!("{}: PLY file missing end_header", path.display()))?
+        + b"end_header\n".len();
+
+    // Read up to 100 vertices, each is 6 × f32_le = 24 bytes
+    const VERTEX_STRIDE: usize = 24;
+    const MAX_PLY_POINTS: usize = 1000_000_00;
+    let data = &raw[header_end..];
+    let count = (data.len() / VERTEX_STRIDE).min(MAX_PLY_POINTS);
+    positions.reserve(count);
+    normals.reserve(count);
+    colors.reserve(count);
+
+    for i in 0..count {
+        let offset = i * VERTEX_STRIDE;
+        let chunk = &data[offset..offset + VERTEX_STRIDE];
+
+        let x = f32::from_le_bytes(chunk[0..4].try_into()?);
+        let y = f32::from_le_bytes(chunk[4..8].try_into()?);
+        let z = f32::from_le_bytes(chunk[8..12].try_into()?);
+        let nx = f32::from_le_bytes(chunk[12..16].try_into()?);
+        let ny = f32::from_le_bytes(chunk[16..20].try_into()?);
+        let nz = f32::from_le_bytes(chunk[20..24].try_into()?);
+
+        let position = [x, y, z];
+        let normal = normalize([nx, ny, nz]);
+
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+        positions.push(position);
+        normals.push(normal);
+        colors.push([1.0, 1.0, 1.0, 1.0]);
+    }
+
+    Ok(())
 }
 
 fn parse_color(r: f32, g: f32, b: f32, a: f32) -> [f32; 4] {
