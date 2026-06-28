@@ -106,7 +106,10 @@ impl<T: BufElement> Buf<T> {
                 let byte_size = std::mem::size_of_val(data) as u64;
 
                 if let Some(old) = old_value {
-                    if old.usage == source.usage && old.capacity >= byte_size {
+                    if old.usage == source.usage
+                        && old.capacity >= byte_size
+                        && old.usage.contains(wgpu::BufferUsages::COPY_DST)
+                    {
                         cx.queue
                             .write_buffer(&old.buffer, 0, bytemuck::cast_slice(data));
                         return GpuBuffer {

@@ -47,8 +47,8 @@ impl App {
 
         let left_view = EguiView3d::new(device.clone(), queue.clone(), 450, 600, 6.0)
             .with_texture_name("left scene");
-        let right_view = EguiView3d::new(device, queue, 450, 600, 6.0)
-            .with_texture_name("right scene");
+        let right_view =
+            EguiView3d::new(device, queue, 450, 600, 6.0).with_texture_name("right scene");
         let scene = Scene::new(&left_view.view);
 
         Self {
@@ -62,14 +62,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let left_tex_id = self.left_view.render_to_egui(
-            &self.render_state,
-            |cx, pass| self.scene.render(cx, pass),
-        );
-        let right_tex_id = self.right_view.render_to_egui(
-            &self.render_state,
-            |cx, pass| self.scene.render(cx, pass),
-        );
+        let left_tex_id = self
+            .left_view
+            .render_to_egui(&self.render_state, |cx, pass| self.scene.render(cx, pass));
+        let right_tex_id = self
+            .right_view
+            .render_to_egui(&self.render_state, |cx, pass| self.scene.render(cx, pass));
 
         egui::Panel::top("header").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
