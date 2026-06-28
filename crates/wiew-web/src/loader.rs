@@ -1,9 +1,10 @@
-use std::{cell::RefCell, io::Cursor};
+use std::{cell::RefCell, collections::VecDeque, io::Cursor};
 
+use js_sys::Array;
 use wasm_bindgen::prelude::*;
 use wiew::{
     mesh::{Color, Normal, Position},
-    provided::{PcLod, PcLodConfig},
+    provided::{PC_LOD_PAYLOAD_CHUNK_SIZE, PcLod, PcLodConfig},
 };
 
 // ---------------------------------------------------------------------------
@@ -12,6 +13,8 @@ use wiew::{
 
 thread_local! {
     pub(crate) static PENDING_LOD: RefCell<Option<PcLod>> = const { RefCell::new(None) };
+    pub(crate) static PENDING_LOD_PAYLOADS: RefCell<VecDeque<(usize, Vec<u8>)>> = const { RefCell::new(VecDeque::new()) };
+    pub(crate) static PENDING_LOD_PAYLOAD_REQUESTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +36,7 @@ pub fn load_ply_xz(compressed: &[u8]) -> Result<(), JsValue> {
     let (positions, normals, colors) = parse_ply(&ply_bytes)?;
 
     // 3. Build LOD tree
-    let lod = PcLod::from_points(
+    let lod = PcLod::from_streams(
         positions,
         normals,
         colors,
@@ -51,6 +54,52 @@ pub fn load_ply_xz(compressed: &[u8]) -> Result<(), JsValue> {
     PENDING_LOD.with(|p| *p.borrow_mut() = Some(lod));
 
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn load_wlod_metadata(metadata: &[u8]) -> Result<(), JsValue> {
+    let lod = PcLod::from_cache_metadata_bytes(metadata)
+        .map_err(|e| JsValue::from_str(&format!("PcLod metadata load failed: {e}")))?;
+    PENDING_LOD.with(|p| *p.borrow_mut() = Some(lod));
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn load_wlod_payloads(payloads: &[u8]) -> Result<(), JsValue> {
+    PENDING_LOD_PAYLOADS.with(|p| p.borrow_mut().push_back((0, payloads.to_vec())));
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn load_wlod_payload_chunk(chunk_index: usize, payloads: &[u8]) -> Result<(), JsValue> {
+    PENDING_LOD_PAYLOADS.with(|p| p.borrow_mut().push_back((chunk_index, payloads.to_vec())));
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn take_wlod_payload_requests() -> Array {
+    let requests = Array::new();
+    PENDING_LOD_PAYLOAD_REQUESTS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        for chunk_index in pending.iter() {
+            requests.push(&JsValue::from_f64(*chunk_index as f64));
+        }
+        pending.clear();
+    });
+    requests
+}
+
+pub(crate) fn payload_chunk_offset(chunk_index: usize) -> usize {
+    chunk_index * PC_LOD_PAYLOAD_CHUNK_SIZE
+}
+
+pub(crate) fn queue_payload_request(chunk_index: usize) {
+    PENDING_LOD_PAYLOAD_REQUESTS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if !pending.contains(&chunk_index) {
+            pending.push(chunk_index);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

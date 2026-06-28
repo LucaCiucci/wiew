@@ -3963,6 +3963,7 @@ dependencies = [
  "console_error_panic_hook",
  "eframe",
  "egui",
+ "js-sys",
  "log",
  "lzma-rs",
  "wasm-bindgen",

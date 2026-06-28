@@ -43,9 +43,77 @@
             addEventListener("TrunkApplicationStarted", resolve, { once: true });
         });
 
-        // If ?ply=... is in the URL, fetch and load the external PLY
-        const plyParam = new URLSearchParams(location.search).get("ply");
-        if (plyParam) {
+        const params = new URLSearchParams(location.search);
+        const wlodParam = params.get("wlod");
+        const plyParam = params.get("ply");
+
+        if (wlodParam) {
+            const metaResp = await fetch(`${wlodParam}.meta.wlod`);
+            if (!metaResp.ok) throw new Error(`metadata fetch failed: ${metaResp.status}`);
+            const metaBuf = await metaResp.arrayBuffer();
+            window.wasmBindings.load_wlod_metadata(new Uint8Array(metaBuf));
+
+            const maxConcurrentChunkLoads = 2;
+            const requestedChunks = [];
+            const loadingChunks = new Set();
+            const loadedChunks = new Set();
+            const queuedChunks = new Set();
+            const failedChunks = new Set();
+
+            const scheduleChunk = (chunkIndex) => {
+                if (
+                    queuedChunks.has(chunkIndex) ||
+                    loadingChunks.has(chunkIndex) ||
+                    loadedChunks.has(chunkIndex) ||
+                    failedChunks.has(chunkIndex)
+                ) {
+                    return;
+                }
+                queuedChunks.add(chunkIndex);
+                requestedChunks.push(chunkIndex);
+            };
+
+            const pumpChunkLoads = () => {
+                while (
+                    loadingChunks.size < maxConcurrentChunkLoads &&
+                    requestedChunks.length > 0
+                ) {
+                    const chunkIndex = requestedChunks.shift();
+                    queuedChunks.delete(chunkIndex);
+                    loadChunk(chunkIndex);
+                }
+            };
+
+            const loadChunk = async (chunkIndex) => {
+                if (loadingChunks.has(chunkIndex) || loadedChunks.has(chunkIndex)) return;
+                loadingChunks.add(chunkIndex);
+                const chunkName = `${wlodParam}.payloads.${String(chunkIndex).padStart(5, "0")}.bin`;
+                try {
+                    const resp = await fetch(chunkName);
+                    if (!resp.ok) {
+                        failedChunks.add(chunkIndex);
+                        console.warn(`payload chunk fetch failed: ${chunkName} (${resp.status})`);
+                        return;
+                    }
+                    const buf = await resp.arrayBuffer();
+                    window.wasmBindings.load_wlod_payload_chunk(chunkIndex, new Uint8Array(buf));
+                    loadedChunks.add(chunkIndex);
+                } finally {
+                    loadingChunks.delete(chunkIndex);
+                    pumpChunkLoads();
+                }
+            };
+
+            const pumpRequests = () => {
+                const requests = window.wasmBindings.take_wlod_payload_requests();
+                for (const chunkIndex of requests) {
+                    scheduleChunk(Number(chunkIndex));
+                }
+                pumpChunkLoads();
+                requestAnimationFrame(pumpRequests);
+            };
+            requestAnimationFrame(pumpRequests);
+        } else if (plyParam) {
             const resp = await fetch(plyParam);
             const buf = await resp.arrayBuffer();
             window.wasmBindings.load_ply_xz(new Uint8Array(buf));

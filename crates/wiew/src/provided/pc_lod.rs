@@ -5,7 +5,7 @@
 //! choose one of several prebuilt point-count levels from their projected
 //! screen coverage.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 use cgmath::{EuclideanSpace, InnerSpace, Matrix4, Point3, Vector3, Vector4};
 
@@ -20,6 +20,7 @@ mod cache;
 mod config;
 mod point;
 
+pub use cache::{PC_LOD_PAYLOAD_CHUNK_SIZE, PcLodCacheParts, PcLodPayloadChunkRequest};
 pub use config::*;
 pub use point::*;
 
@@ -32,6 +33,8 @@ pub struct PcLod {
     leaf_meshes: Vec<Mesh>,
     leaf_lods: Vec<Vec<Mesh>>,
     node_lods: Vec<Vec<Mesh>>,
+    cache_payloads: Vec<cache::PcLodPayloadDesc>,
+    requested_cache_payload_chunks: RefCell<BTreeMap<usize, u8>>,
     proxy_mesh: RefCell<Mesh>,
     bounds_mesh: RefCell<Mesh>,
     pipeline: ColoredSplatPipeline,
@@ -65,6 +68,8 @@ impl PcLod {
             leaf_meshes: builder.leaf_meshes,
             leaf_lods: builder.leaf_lods,
             node_lods: builder.node_lods,
+            cache_payloads: Vec::new(),
+            requested_cache_payload_chunks: RefCell::new(BTreeMap::new()),
             proxy_mesh: RefCell::new(dynamic_proxy_mesh()),
             bounds_mesh: RefCell::new(dynamic_bounds_mesh()),
             pipeline: ColoredSplatPipeline::new(),
@@ -185,12 +190,12 @@ impl PcLod {
         viewport: [f32; 2],
         fov_y_deg: f32,
         selection: &mut PcLodSelection,
-    ) {
+    ) -> bool {
         selection.stats.visited_nodes += 1;
         let node = &self.nodes[node_id];
         let Some(screen_rect) = node.projected_screen_rect(view_proj, viewport) else {
             selection.stats.culled_nodes += 1;
-            return;
+            return true;
         };
 
         let diameter_px = node.projected_diameter_px(view, viewport[1], fov_y_deg);
@@ -198,34 +203,62 @@ impl PcLod {
             selection.proxies.push(node.representative);
             selection.bounds.push((node.bounds, PcLodBoundsKind::Proxy));
             selection.stats.selected_proxy_points += 1;
-            return;
+            return true;
         }
 
+        let node_lod = node
+            .leaf_mesh
+            .is_none()
+            .then(|| self.node_lod_for(node, screen_rect))
+            .flatten();
         if node.leaf_mesh.is_none()
-            && let Some(lod) = self.node_lod_for(node, screen_rect)
+            && let Some(lod) = node_lod
+            && lod.satisfies_desired
         {
             selection.node_lods.push(SelectedNodeLod {
                 node_lods: lod.node_lods,
                 lod: lod.lod,
+                satisfies_desired: lod.satisfies_desired,
             });
             selection
                 .bounds
                 .push((node.bounds, PcLodBoundsKind::NodeLod));
-            return;
+            return true;
         }
 
         if let Some(leaf_mesh) = node.leaf_mesh {
-            selection.leaf_meshes.push(SelectedLeafMesh {
-                leaf: leaf_mesh,
-                lod: self.leaf_lod_for(leaf_mesh, screen_rect),
-            });
+            let selected = self.leaf_lod_for(leaf_mesh, screen_rect);
+            let is_drawable = self.selected_leaf_is_loaded(leaf_mesh, selected);
+            if is_drawable {
+                selection.leaf_meshes.push(SelectedLeafMesh {
+                    leaf: leaf_mesh,
+                    lod: selected,
+                });
+            }
+            if !is_drawable {
+                self.request_leaf_mesh_payload(leaf_mesh);
+            }
             selection.bounds.push((node.bounds, PcLodBoundsKind::Leaf));
-            return;
+            return is_drawable;
         }
 
+        let mut children_covered = true;
         for child in node.children.iter().flatten() {
-            self.select_node(*child, view, view_proj, viewport, fov_y_deg, selection);
+            children_covered &=
+                self.select_node(*child, view, view_proj, viewport, fov_y_deg, selection);
         }
+        if !children_covered && let Some(lod) = node_lod {
+            selection.node_lods.push(SelectedNodeLod {
+                node_lods: lod.node_lods,
+                lod: lod.lod,
+                satisfies_desired: lod.satisfies_desired,
+            });
+            selection
+                .bounds
+                .push((node.bounds, PcLodBoundsKind::NodeLod));
+            return true;
+        }
+        children_covered
     }
 
     fn node_lod_for(&self, node: &PcLodNode, screen_rect: ScreenRect) -> Option<SelectedNodeLod> {
@@ -235,24 +268,73 @@ impl PcLod {
             .ceil()
             .clamp(1.0, node.point_count as f32) as usize;
 
-        lods.iter().enumerate().find_map(|(index, mesh)| {
-            let count = mesh.vertex_count().unwrap_or_default();
-            (count <= self.config.node_lod_point_count
-                && count >= desired_points
-                && count < node.point_count)
-                .then_some(SelectedNodeLod {
-                    node_lods,
-                    lod: index,
-                })
+        let mut desired = None;
+        let mut best_loaded = None;
+        let mut first_unloaded = None;
+
+        for (index, mesh) in lods.iter().enumerate() {
+            let loaded_count = mesh.vertex_count().unwrap_or_default();
+            let target = cache::PayloadTarget::NodeLod {
+                set: node_lods,
+                lod: index,
+            };
+            let count =
+                loaded_count.max(self.cache_payload_point_count(target).unwrap_or_default());
+            if count == 0 || count >= node.point_count || count > self.config.node_lod_point_count {
+                continue;
+            }
+
+            if loaded_count > 0 {
+                best_loaded = Some(index);
+            } else if first_unloaded.is_none() {
+                first_unloaded = Some(index);
+            }
+
+            if count >= desired_points {
+                desired = Some(index);
+                break;
+            }
+        }
+
+        if let Some(next) =
+            first_unloaded.filter(|next| desired.is_none_or(|desired| *next <= desired))
+        {
+            self.request_node_lod_payload(node_lods, next);
+        }
+
+        best_loaded.map(|lod| SelectedNodeLod {
+            node_lods,
+            lod,
+            satisfies_desired: desired.is_some_and(|desired| lod >= desired),
         })
     }
 
+    fn selected_leaf_is_loaded(&self, leaf: usize, lod: Option<usize>) -> bool {
+        match lod {
+            Some(lod) => self
+                .leaf_lods
+                .get(leaf)
+                .and_then(|lods| lods.get(lod))
+                .and_then(|mesh| mesh.vertex_count())
+                .is_some_and(|count| count > 0),
+            None => self
+                .leaf_meshes
+                .get(leaf)
+                .and_then(|mesh| mesh.vertex_count())
+                .is_some_and(|count| count > 0),
+        }
+    }
+
     fn leaf_lod_for(&self, leaf: usize, screen_rect: ScreenRect) -> Option<usize> {
-        let full_count = self
+        let loaded_full_count = self
             .leaf_meshes
             .get(leaf)
             .and_then(|mesh| mesh.vertex_count())
             .unwrap_or_default();
+        let full_count = loaded_full_count.max(
+            self.cache_payload_point_count(cache::PayloadTarget::LeafMesh(leaf))
+                .unwrap_or_default(),
+        );
         if full_count == 0 {
             return None;
         }
@@ -262,12 +344,50 @@ impl PcLod {
             .ceil()
             .clamp(1.0, full_count as f32) as usize;
 
-        self.leaf_lods.get(leaf).and_then(|lods| {
-            lods.iter().enumerate().find_map(|(index, mesh)| {
-                let count = mesh.vertex_count().unwrap_or_default();
-                (count >= desired_points && count < full_count).then_some(index)
-            })
-        })
+        if let Some(lods) = self.leaf_lods.get(leaf) {
+            let mut desired = None;
+            let mut best_loaded = None;
+            let mut first_unloaded = None;
+
+            for (index, mesh) in lods.iter().enumerate() {
+                let loaded_count = mesh.vertex_count().unwrap_or_default();
+                let target = cache::PayloadTarget::LeafLod {
+                    set: leaf,
+                    lod: index,
+                };
+                let count =
+                    loaded_count.max(self.cache_payload_point_count(target).unwrap_or_default());
+                if count == 0 || count >= full_count {
+                    continue;
+                }
+
+                if loaded_count > 0 {
+                    best_loaded = Some(index);
+                } else if first_unloaded.is_none() {
+                    first_unloaded = Some(index);
+                }
+
+                if count >= desired_points {
+                    desired = Some(index);
+                    break;
+                }
+            }
+
+            if let Some(next) =
+                first_unloaded.filter(|next| desired.is_none_or(|desired| *next <= desired))
+            {
+                self.request_leaf_lod_payload(leaf, next);
+            }
+
+            if desired.is_some() || best_loaded.is_some() {
+                return best_loaded;
+            }
+        }
+
+        if loaded_full_count == 0 {
+            self.request_leaf_mesh_payload(leaf);
+        }
+        None
     }
 }
 
@@ -390,6 +510,7 @@ struct PcLodSelection {
 struct SelectedNodeLod {
     node_lods: usize,
     lod: usize,
+    satisfies_desired: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -844,8 +965,24 @@ mod tests {
             },
         );
 
-        let bytes = lod.to_cache_bytes().expect("cache write");
-        let loaded = PcLod::from_cache_bytes(&bytes).expect("cache read");
+        let parts = lod.to_cache_parts().expect("split cache write");
+        let loaded = PcLod::from_cache_parts(parts).expect("split cache read");
+
+        assert_eq!(loaded.total_points(), lod.total_points());
+        assert_eq!(loaded.node_count(), lod.node_count());
+        assert_eq!(loaded.leaf_count(), lod.leaf_count());
+
+        let parts = lod.to_cache_parts().expect("metadata cache write");
+        let mut loaded = PcLod::from_cache_metadata_bytes(&parts.metadata).expect("metadata read");
+        assert_eq!(loaded.total_points(), lod.total_points());
+        assert_eq!(loaded.node_count(), lod.node_count());
+        assert_eq!(loaded.leaf_count(), lod.leaf_count());
+        loaded
+            .apply_cache_payloads(&parts.payloads)
+            .expect("payload apply");
+
+        let bytes = lod.to_cache_bytes().expect("bundled cache write");
+        let loaded = PcLod::from_cache_bytes(&bytes).expect("bundled cache read");
 
         assert_eq!(loaded.total_points(), lod.total_points());
         assert_eq!(loaded.node_count(), lod.node_count());

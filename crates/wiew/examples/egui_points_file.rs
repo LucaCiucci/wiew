@@ -16,7 +16,8 @@ use wiew::{
     egui_view::EguiView3d,
     mesh::{Color, Mesh, Normal, Position},
     provided::{
-        Grid, PcLod, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
+        Grid, PC_LOD_PAYLOAD_CHUNK_SIZE, PcLod, QuadBackground, QuadBackgroundConfig,
+        TrackballGizmo,
         pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
     },
 };
@@ -472,7 +473,8 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 // ---------------------------------------------------------------------------
 
 fn ply_file_paths() -> Vec<PathBuf> {
-    ["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
+    //["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
+    ["tot.ply"]
         .into_iter()
         .map(|file| {
             let cwd_path = PathBuf::from(file);
@@ -488,10 +490,18 @@ fn ply_file_paths() -> Vec<PathBuf> {
 }
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
-    let cache_path = ply_lod_cache_path();
-    if cache_path.exists() {
-        let bytes = fs::read(&cache_path)?;
-        let lod = PcLod::from_cache_bytes(&bytes)?;
+    let (metadata_path, payloads_prefix) = ply_lod_cache_paths();
+    if metadata_path.exists() {
+        let metadata = fs::read(&metadata_path)?;
+        let mut lod = PcLod::from_cache_metadata_bytes(&metadata)?;
+        for chunk_index in 0.. {
+            let path = payload_chunk_path(&payloads_prefix, chunk_index);
+            if !path.exists() {
+                break;
+            }
+            let payloads = fs::read(path)?;
+            lod.apply_cache_payload_chunk(chunk_index * PC_LOD_PAYLOAD_CHUNK_SIZE, &payloads)?;
+        }
         let point_count = lod.total_points();
         return Ok(LoadedPointCloudLod { lod, point_count });
     }
@@ -547,12 +557,28 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
 
     let point_count = positions.len();
     let lod = PcLod::from_streams(positions, normals, colors, Default::default())?;
-    fs::write(cache_path, lod.to_cache_bytes()?)?;
+    let parts = lod.to_cache_parts()?;
+    fs::write(metadata_path, parts.metadata)?;
+    write_payload_chunks(&payloads_prefix, &parts.payloads)?;
     Ok(LoadedPointCloudLod { lod, point_count })
 }
 
-fn ply_lod_cache_path() -> PathBuf {
-    PathBuf::from("stress_test.wlod")
+fn ply_lod_cache_paths() -> (PathBuf, PathBuf) {
+    (
+        PathBuf::from("crates/wiew-web/dist/stress_test.meta.wlod"),
+        PathBuf::from("crates/wiew-web/dist/stress_test.payloads"),
+    )
+}
+
+fn payload_chunk_path(prefix: &Path, chunk_index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{chunk_index:05}.bin", prefix.display()))
+}
+
+fn write_payload_chunks(prefix: &Path, payloads: &[u8]) -> Result<(), Box<dyn Error>> {
+    for (chunk_index, chunk) in payloads.chunks(PC_LOD_PAYLOAD_CHUNK_SIZE).enumerate() {
+        fs::write(payload_chunk_path(prefix, chunk_index), chunk)?;
+    }
+    Ok(())
 }
 
 fn load_one_ply_points(
