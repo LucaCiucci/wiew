@@ -226,10 +226,10 @@ impl PcLod {
     ) {
         selection.stats.visited_nodes += 1;
         let node = &self.nodes[node_id];
-        if !node.bounds_may_be_visible(view_proj) {
+        let Some(screen_rect) = node.projected_screen_rect(view_proj, viewport) else {
             selection.stats.culled_nodes += 1;
             return;
-        }
+        };
 
         let diameter_px = node.projected_diameter_px(view, viewport[1], fov_y_deg);
         if diameter_px <= self.config.proxy_diameter_px {
@@ -242,7 +242,7 @@ impl PcLod {
         if let Some(leaf_mesh) = node.leaf_mesh {
             selection.leaf_meshes.push(SelectedLeafMesh {
                 leaf: leaf_mesh,
-                lod: self.leaf_lod_for(leaf_mesh, node, view_proj, viewport),
+                lod: self.leaf_lod_for(leaf_mesh, screen_rect),
             });
             selection.bounds.push((node.bounds, PcLodBoundsKind::Leaf));
             return;
@@ -253,13 +253,7 @@ impl PcLod {
         }
     }
 
-    fn leaf_lod_for(
-        &self,
-        leaf: usize,
-        node: &PcLodNode,
-        view_proj: Matrix4<f32>,
-        viewport: [f32; 2],
-    ) -> Option<usize> {
+    fn leaf_lod_for(&self, leaf: usize, screen_rect: ScreenRect) -> Option<usize> {
         let full_count = self
             .leaf_meshes
             .get(leaf)
@@ -269,7 +263,7 @@ impl PcLod {
             return None;
         }
 
-        let projected_area = node.projected_area_px(view_proj, viewport);
+        let projected_area = screen_rect.area();
         let desired_points = (projected_area * self.config.points_per_pixel)
             .ceil()
             .clamp(1.0, full_count as f32) as usize;
@@ -498,21 +492,41 @@ impl PcLodNode {
         radius * 2.0 * focal_px / depth
     }
 
-    fn projected_area_px(&self, view_proj: Matrix4<f32>, viewport: [f32; 2]) -> f32 {
+    fn projected_screen_rect(
+        &self,
+        view_proj: Matrix4<f32>,
+        viewport: [f32; 2],
+    ) -> Option<ScreenRect> {
+        let mut all_left = true;
+        let mut all_right = true;
+        let mut all_below = true;
+        let mut all_above = true;
+        let mut all_before_near = true;
+        let mut all_after_far = true;
+        let mut crosses_eye = false;
         let mut min = [f32::INFINITY; 2];
         let mut max = [f32::NEG_INFINITY; 2];
         let mut visible_corner_count = 0usize;
 
         for corner in self.bounds.corners() {
             let clip = view_proj * Vector4::new(corner.x, corner.y, corner.z, 1.0);
+
+            all_left &= clip.x < -clip.w;
+            all_right &= clip.x > clip.w;
+            all_below &= clip.y < -clip.w;
+            all_above &= clip.y > clip.w;
+            all_before_near &= clip.z < 0.0;
+            all_after_far &= clip.z > clip.w;
+
             if clip.w <= 0.0 {
+                crosses_eye = true;
                 continue;
             }
 
             let ndc = [clip.x / clip.w, clip.y / clip.w];
             let screen = [
-                (ndc[0] * 0.5 + 0.5) * viewport[0],
-                (1.0 - (ndc[1] * 0.5 + 0.5)) * viewport[1],
+                ((ndc[0] * 0.5 + 0.5) * viewport[0]).clamp(0.0, viewport[0]),
+                ((1.0 - (ndc[1] * 0.5 + 0.5)) * viewport[1]).clamp(0.0, viewport[1]),
             ];
             for axis in 0..2 {
                 min[axis] = min[axis].min(screen[axis]);
@@ -521,42 +535,36 @@ impl PcLodNode {
             visible_corner_count += 1;
         }
 
-        if visible_corner_count == 0 {
-            return viewport[0] * viewport[1];
+        if all_left || all_right || all_below || all_above || all_before_near || all_after_far {
+            return None;
         }
 
-        let width = (max[0] - min[0]).abs().min(viewport[0]);
-        let height = (max[1] - min[1]).abs().min(viewport[1]);
-        (width * height).max(1.0)
+        if visible_corner_count == 0 || crosses_eye {
+            return Some(ScreenRect::full(viewport));
+        }
+
+        Some(ScreenRect { min, max })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScreenRect {
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+impl ScreenRect {
+    fn full(viewport: [f32; 2]) -> Self {
+        Self {
+            min: [0.0, 0.0],
+            max: viewport,
+        }
     }
 
-    fn bounds_may_be_visible(&self, view_proj: Matrix4<f32>) -> bool {
-        let mut all_left = true;
-        let mut all_right = true;
-        let mut all_below = true;
-        let mut all_above = true;
-        let mut all_before_near = true;
-        let mut all_after_far = true;
-
-        for corner in self.bounds.corners() {
-            let clip = view_proj * Vector4::new(corner.x, corner.y, corner.z, 1.0);
-
-            // Keep boxes that cross behind the eye. Homogeneous clipping around
-            // w <= 0 is easy to get subtly wrong, and overdraw is preferable to
-            // dropping visible chunks while zoomed into the cloud.
-            if clip.w <= 0.0 {
-                return true;
-            }
-
-            all_left &= clip.x < -clip.w;
-            all_right &= clip.x > clip.w;
-            all_below &= clip.y < -clip.w;
-            all_above &= clip.y > clip.w;
-            all_before_near &= clip.z < 0.0;
-            all_after_far &= clip.z > clip.w;
-        }
-
-        !(all_left || all_right || all_below || all_above || all_before_near || all_after_far)
+    fn area(self) -> f32 {
+        let width = (self.max[0] - self.min[0]).abs().max(1.0);
+        let height = (self.max[1] - self.min[1]).abs().max(1.0);
+        width * height
     }
 }
 

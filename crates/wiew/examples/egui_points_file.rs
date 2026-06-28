@@ -458,19 +458,23 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 // ---------------------------------------------------------------------------
 
 fn ply_file_paths() -> Vec<PathBuf> {
-    ["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
-        .into_iter()
-        .map(|file| {
-            let cwd_path = PathBuf::from(file);
-            if cwd_path.exists() {
-                cwd_path
-            } else {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join(file)
-            }
-        })
-        .collect()
+    [
+        "tot.ply",
+        "tot_fiori.ply",
+        "punti_fibbia.ply",
+    ]
+    .into_iter()
+    .map(|file| {
+        let cwd_path = PathBuf::from(file);
+        if cwd_path.exists() {
+            cwd_path
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(file)
+        }
+    })
+    .collect()
 }
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
