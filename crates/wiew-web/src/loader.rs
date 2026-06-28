@@ -41,6 +41,7 @@ pub fn load_ply_xz(compressed: &[u8]) -> Result<(), JsValue> {
             leaf_point_count: 65_536,
             proxy_diameter_px: 2.5,
             points_per_pixel: 1.05,
+            node_lod_point_count: 8_192,
             max_depth: 14,
         },
     )
