@@ -1,6 +1,7 @@
-use crate::{mesh::{Color, Normal, Position}, provided::PcLodBuildError};
-
-
+use crate::{
+    mesh::{Color, Normal, Position},
+    provided::PcLodBuildError,
+};
 
 /// A point in a [`PcLod`](super::PcLod) point cloud.
 ///
@@ -35,15 +36,16 @@ impl PcLodPoint {
             });
         }
 
-        let points = positions
-            .into_iter()
-            .zip(normals)
-            .zip(colors)
-            .map(|((position, normal), color)| PcLodPoint {
-                position,
-                normal,
-                color,
-            });
+        let points =
+            positions
+                .into_iter()
+                .zip(normals)
+                .zip(colors)
+                .map(|((position, normal), color)| PcLodPoint {
+                    position,
+                    normal,
+                    color,
+                });
 
         Ok(points)
     }

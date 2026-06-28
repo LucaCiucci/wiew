@@ -5,7 +5,7 @@
 
 use std::{
     error::Error,
-    fs::File,
+    fs::{self, File},
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
@@ -488,6 +488,14 @@ fn ply_file_paths() -> Vec<PathBuf> {
 }
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
+    let cache_path = ply_lod_cache_path();
+    if cache_path.exists() {
+        let bytes = fs::read(&cache_path)?;
+        let lod = PcLod::from_cache_bytes(&bytes)?;
+        let point_count = lod.total_points();
+        return Ok(LoadedPointCloudLod { lod, point_count });
+    }
+
     let mut positions = Vec::<Position>::new();
     let mut normals = Vec::<Normal>::new();
     let mut colors = Vec::<Color>::new();
@@ -538,13 +546,13 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
     }
 
     let point_count = positions.len();
-    let lod = PcLod::from_streams(
-        positions,
-        normals,
-        colors,
-        Default::default(),
-    )?;
+    let lod = PcLod::from_streams(positions, normals, colors, Default::default())?;
+    fs::write(cache_path, lod.to_cache_bytes()?)?;
     Ok(LoadedPointCloudLod { lod, point_count })
+}
+
+fn ply_lod_cache_path() -> PathBuf {
+    PathBuf::from("stress_test.wlod")
 }
 
 fn load_one_ply_points(

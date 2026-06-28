@@ -1,4 +1,3 @@
-
 pub(super) const LEAF_LOD_TARGETS: [usize; 5] = [512, 2_048, 8_192, 32_768, 131_072];
 pub(super) const NODE_LOD_TARGETS: [usize; 3] = [512, 2_048, 8_192];
 

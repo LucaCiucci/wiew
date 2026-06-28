@@ -16,6 +16,7 @@ use crate::{
     provided::pipelines::{ColoredSplatPipeline, FlatPipeline, LitMaterial},
 };
 
+mod cache;
 mod config;
 mod point;
 
@@ -113,6 +114,10 @@ impl PcLod {
 
     pub fn leaf_count(&self) -> usize {
         self.leaf_meshes.len()
+    }
+
+    pub fn total_points(&self) -> usize {
+        self.total_points
     }
 
     pub fn stats(&self) -> PcLodStats {
@@ -810,4 +815,40 @@ fn octant(position: Position, center: Point3<f32>) -> usize {
         index |= 4;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_round_trips_tree_and_payload_counts() {
+        let points = (0..128)
+            .map(|i| {
+                let x = (i % 8) as f32;
+                let y = ((i / 8) % 4) as f32;
+                let z = (i / 32) as f32;
+                PcLodPoint {
+                    position: [x, y, z],
+                    normal: [0.0, 1.0, 0.0],
+                    color: [1.0, 0.5, 0.25, 1.0],
+                }
+            })
+            .collect();
+        let lod = PcLod::from_points(
+            points,
+            PcLodConfig {
+                leaf_point_count: 8,
+                node_lod_point_count: 32,
+                ..Default::default()
+            },
+        );
+
+        let bytes = lod.to_cache_bytes().expect("cache write");
+        let loaded = PcLod::from_cache_bytes(&bytes).expect("cache read");
+
+        assert_eq!(loaded.total_points(), lod.total_points());
+        assert_eq!(loaded.node_count(), lod.node_count());
+        assert_eq!(loaded.leaf_count(), lod.leaf_count());
+    }
 }

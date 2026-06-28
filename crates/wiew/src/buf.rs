@@ -84,6 +84,13 @@ impl<T: BufElement> Buf<T> {
         }
     }
 
+    pub fn to_vec(&self) -> Option<Vec<T>> {
+        match &*self.res.source().data {
+            BufSource::Vec(data) => Some(data.clone()),
+            BufSource::Loader(_) => None,
+        }
+    }
+
     pub fn is_empty(&self) -> Option<bool> {
         self.len().map(|len| len == 0)
     }
