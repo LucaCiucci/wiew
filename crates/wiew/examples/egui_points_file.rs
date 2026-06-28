@@ -231,6 +231,18 @@ fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
         lod.config_mut().proxy_diameter_px = proxy_diameter_px;
     }
 
+    let mut points_per_pixel = lod.config().points_per_pixel;
+    if ui
+        .add(
+            egui::Slider::new(&mut points_per_pixel, 0.001..=1.0)
+                .logarithmic(true)
+                .text("Pts/px"),
+        )
+        .changed()
+    {
+        lod.config_mut().points_per_pixel = points_per_pixel;
+    }
+
     let stats = lod.stats();
     let drawn = stats.drawn_points();
     let percent = if stats.total_points > 0 {
@@ -260,6 +272,13 @@ fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
             ui.label(format!(
                 "{} proxies / {} leaves",
                 stats.selected_proxy_points, stats.selected_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Leaf LOD");
+            ui.label(format!(
+                "{} coarse / {} full",
+                stats.selected_leaf_lod_chunks, stats.selected_full_leaf_chunks
             ));
             ui.end_row();
 
@@ -440,8 +459,8 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 
 fn ply_file_path() -> PathBuf {
     //let cwd_path = PathBuf::from("tot.ply");
-    //let cwd_path = PathBuf::from("tot_fiori.ply");
-    let cwd_path = PathBuf::from("punti_fibbia.ply");
+    let cwd_path = PathBuf::from("tot_fiori.ply");
+    //let cwd_path = PathBuf::from("punti_fibbia.ply");
     if cwd_path.exists() {
         return cwd_path;
     }
@@ -525,8 +544,9 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
         normals,
         colors,
         PcLodConfig {
-            leaf_point_count: 65_536 / 64,
-            proxy_diameter_px: 2.5 * 2.0,
+            leaf_point_count: 65_536,
+            proxy_diameter_px: 2.5,
+            points_per_pixel: 1.05,
             max_depth: 14,
         },
     )?;

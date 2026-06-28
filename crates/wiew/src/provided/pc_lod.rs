@@ -2,7 +2,8 @@
 //!
 //! This is a CPU-side proof of concept for adaptive point-cloud rendering:
 //! internal octree nodes are rendered as representative surfels, while leaves
-//! are rendered as full point chunks.
+//! choose one of several prebuilt point-count levels from their projected
+//! screen coverage.
 
 use std::cell::RefCell;
 
@@ -15,6 +16,8 @@ use crate::{
     provided::pipelines::{ColoredSplatPipeline, FlatPipeline, LitMaterial},
 };
 
+const LEAF_LOD_TARGETS: [usize; 5] = [512, 2_048, 8_192, 32_768, 131_072];
+
 #[derive(Debug, Clone)]
 pub struct PcLodConfig {
     /// Stop splitting once a node reaches this depth.
@@ -24,6 +27,9 @@ pub struct PcLodConfig {
     /// Render a node representative when its projected diameter is below this
     /// threshold. Larger nodes descend into children or leaf chunks.
     pub proxy_diameter_px: f32,
+    /// Desired point density for selected leaf chunks. Higher values draw more
+    /// points per screen pixel; lower values favor coarser leaf payloads.
+    pub points_per_pixel: f32,
 }
 
 impl Default for PcLodConfig {
@@ -32,6 +38,7 @@ impl Default for PcLodConfig {
             max_depth: 10,
             leaf_point_count: 32_768,
             proxy_diameter_px: 2.5,
+            points_per_pixel: 0.05,
         }
     }
 }
@@ -54,6 +61,7 @@ pub struct PcLod {
     root: Option<usize>,
     total_points: usize,
     leaf_meshes: Vec<Mesh>,
+    leaf_lods: Vec<Vec<Mesh>>,
     proxy_mesh: RefCell<Mesh>,
     bounds_mesh: RefCell<Mesh>,
     pipeline: ColoredSplatPipeline,
@@ -70,6 +78,7 @@ impl PcLod {
             config: config.clone(),
             nodes: Vec::new(),
             leaf_meshes: Vec::new(),
+            leaf_lods: Vec::new(),
         };
         let root = if points.is_empty() {
             None
@@ -83,6 +92,7 @@ impl PcLod {
             root,
             total_points,
             leaf_meshes: builder.leaf_meshes,
+            leaf_lods: builder.leaf_lods,
             proxy_mesh: RefCell::new(dynamic_proxy_mesh()),
             bounds_mesh: RefCell::new(dynamic_bounds_mesh()),
             pipeline: ColoredSplatPipeline::new(),
@@ -190,10 +200,13 @@ impl PcLod {
         selection
     }
 
-    fn collect_leaves(&self, node_id: usize, leaves: &mut Vec<usize>) {
+    fn collect_leaves(&self, node_id: usize, leaves: &mut Vec<SelectedLeafMesh>) {
         let node = &self.nodes[node_id];
         if let Some(leaf_mesh) = node.leaf_mesh {
-            leaves.push(leaf_mesh);
+            leaves.push(SelectedLeafMesh {
+                leaf: leaf_mesh,
+                lod: None,
+            });
             return;
         }
 
@@ -227,7 +240,10 @@ impl PcLod {
         }
 
         if let Some(leaf_mesh) = node.leaf_mesh {
-            selection.leaf_meshes.push(leaf_mesh);
+            selection.leaf_meshes.push(SelectedLeafMesh {
+                leaf: leaf_mesh,
+                lod: self.leaf_lod_for(leaf_mesh, node, view_proj, viewport),
+            });
             selection.bounds.push((node.bounds, PcLodBoundsKind::Leaf));
             return;
         }
@@ -235,6 +251,35 @@ impl PcLod {
         for child in node.children.iter().flatten() {
             self.select_node(*child, view, view_proj, viewport, fov_y_deg, selection);
         }
+    }
+
+    fn leaf_lod_for(
+        &self,
+        leaf: usize,
+        node: &PcLodNode,
+        view_proj: Matrix4<f32>,
+        viewport: [f32; 2],
+    ) -> Option<usize> {
+        let full_count = self
+            .leaf_meshes
+            .get(leaf)
+            .and_then(|mesh| mesh.vertex_count())
+            .unwrap_or_default();
+        if full_count == 0 {
+            return None;
+        }
+
+        let projected_area = node.projected_area_px(view_proj, viewport);
+        let desired_points = (projected_area * self.config.points_per_pixel)
+            .ceil()
+            .clamp(1.0, full_count as f32) as usize;
+
+        self.leaf_lods.get(leaf).and_then(|lods| {
+            lods.iter().enumerate().find_map(|(index, mesh)| {
+                let count = mesh.vertex_count().unwrap_or_default();
+                (count >= desired_points && count < full_count).then_some(index)
+            })
+        })
     }
 }
 
@@ -262,7 +307,14 @@ impl Drawable for PcLod {
         }
 
         for leaf_mesh in selection.leaf_meshes {
-            if let Some(mesh) = self.leaf_meshes.get(leaf_mesh) {
+            let mesh = match leaf_mesh.lod {
+                Some(lod) => self
+                    .leaf_lods
+                    .get(leaf_mesh.leaf)
+                    .and_then(|lods| lods.get(lod)),
+                None => self.leaf_meshes.get(leaf_mesh.leaf),
+            };
+            if let Some(mesh) = mesh {
                 self.pipeline
                     .draw_mesh_with_material(cx, pass, mesh, &self.material);
             }
@@ -314,6 +366,8 @@ pub struct PcLodStats {
     pub selected_proxy_points: usize,
     pub selected_leaf_chunks: usize,
     pub selected_leaf_points: usize,
+    pub selected_leaf_lod_chunks: usize,
+    pub selected_full_leaf_chunks: usize,
 }
 
 impl PcLodStats {
@@ -325,9 +379,15 @@ impl PcLodStats {
 #[derive(Default)]
 struct PcLodSelection {
     proxies: Vec<PcLodPoint>,
-    leaf_meshes: Vec<usize>,
+    leaf_meshes: Vec<SelectedLeafMesh>,
     bounds: Vec<(Aabb, PcLodBoundsKind)>,
     stats: PcLodStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedLeafMesh {
+    leaf: usize,
+    lod: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,10 +400,23 @@ impl PcLodSelection {
     fn finish_stats(&mut self, lod: &PcLod) {
         self.stats.selected_proxy_points = self.proxies.len();
         self.stats.selected_leaf_chunks = self.leaf_meshes.len();
+        self.stats.selected_leaf_lod_chunks = self
+            .leaf_meshes
+            .iter()
+            .filter(|leaf| leaf.lod.is_some())
+            .count();
+        self.stats.selected_full_leaf_chunks =
+            self.leaf_meshes.len() - self.stats.selected_leaf_lod_chunks;
         self.stats.selected_leaf_points = self
             .leaf_meshes
             .iter()
-            .filter_map(|leaf| lod.leaf_meshes.get(*leaf))
+            .filter_map(|leaf| match leaf.lod {
+                Some(lod_index) => lod
+                    .leaf_lods
+                    .get(leaf.leaf)
+                    .and_then(|leaf_lods| leaf_lods.get(lod_index)),
+                None => lod.leaf_meshes.get(leaf.leaf),
+            })
             .filter_map(|mesh| mesh.positions().len())
             .sum();
     }
@@ -353,6 +426,7 @@ struct PcLodBuilder {
     config: PcLodConfig,
     nodes: Vec<PcLodNode>,
     leaf_meshes: Vec<Mesh>,
+    leaf_lods: Vec<Vec<Mesh>>,
 }
 
 impl PcLodBuilder {
@@ -369,6 +443,7 @@ impl PcLodBuilder {
 
         if depth >= self.config.max_depth || points.len() <= self.config.leaf_point_count {
             let leaf_mesh = self.leaf_meshes.len();
+            self.leaf_lods.push(leaf_lods_from_points(&points));
             self.leaf_meshes.push(mesh_from_points(points));
             self.nodes[node_id].leaf_mesh = Some(leaf_mesh);
             return node_id;
@@ -393,6 +468,7 @@ impl PcLodBuilder {
 
         if !any_child_split {
             self.nodes[node_id].leaf_mesh = Some(self.leaf_meshes.len());
+            self.leaf_lods.push(Vec::new());
             self.leaf_meshes.push(Mesh::new(Vec::new()));
         }
 
@@ -420,6 +496,38 @@ impl PcLodNode {
         let depth = (-view_center.z - radius).max(0.0001);
         let focal_px = viewport_height * 0.5 / (fov_y_deg.to_radians() * 0.5).tan();
         radius * 2.0 * focal_px / depth
+    }
+
+    fn projected_area_px(&self, view_proj: Matrix4<f32>, viewport: [f32; 2]) -> f32 {
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut visible_corner_count = 0usize;
+
+        for corner in self.bounds.corners() {
+            let clip = view_proj * Vector4::new(corner.x, corner.y, corner.z, 1.0);
+            if clip.w <= 0.0 {
+                continue;
+            }
+
+            let ndc = [clip.x / clip.w, clip.y / clip.w];
+            let screen = [
+                (ndc[0] * 0.5 + 0.5) * viewport[0],
+                (1.0 - (ndc[1] * 0.5 + 0.5)) * viewport[1],
+            ];
+            for axis in 0..2 {
+                min[axis] = min[axis].min(screen[axis]);
+                max[axis] = max[axis].max(screen[axis]);
+            }
+            visible_corner_count += 1;
+        }
+
+        if visible_corner_count == 0 {
+            return viewport[0] * viewport[1];
+        }
+
+        let width = (max[0] - min[0]).abs().min(viewport[0]);
+        let height = (max[1] - min[1]).abs().min(viewport[1]);
+        (width * height).max(1.0)
     }
 
     fn bounds_may_be_visible(&self, view_proj: Matrix4<f32>) -> bool {
@@ -537,6 +645,38 @@ fn mesh_from_points(points: Vec<PcLodPoint>) -> Mesh {
     Mesh::new(positions)
         .with_normals(normals)
         .with_colors(colors)
+}
+
+fn leaf_lods_from_points(points: &[PcLodPoint]) -> Vec<Mesh> {
+    let mut lods = Vec::new();
+    let mut last_count = 0usize;
+
+    for target in LEAF_LOD_TARGETS {
+        if target >= points.len() {
+            break;
+        }
+
+        let sampled = sample_points(points, target);
+        if sampled.len() == last_count || sampled.len() >= points.len() {
+            continue;
+        }
+        last_count = sampled.len();
+        lods.push(mesh_from_points(sampled));
+    }
+
+    lods
+}
+
+fn sample_points(points: &[PcLodPoint], target_count: usize) -> Vec<PcLodPoint> {
+    if target_count >= points.len() {
+        return points.to_vec();
+    }
+
+    let mut sampled = Vec::with_capacity(target_count);
+    for index in 0..target_count {
+        sampled.push(points[index * points.len() / target_count]);
+    }
+    sampled
 }
 
 fn dynamic_proxy_mesh() -> Mesh {
