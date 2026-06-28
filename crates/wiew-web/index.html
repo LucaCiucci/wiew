@@ -35,5 +35,19 @@
     <canvas id="wiew_canvas"></canvas>
     <div class="centered" id="loading_text">Loading…</div>
     <link data-trunk rel="rust" href="Cargo.toml" />
+
+    <script type="module">
+        // Wait for the wasm module to initialise (trunk fires this event)
+        await new Promise(resolve => {
+            if (window.wasmBindings) return resolve();
+            addEventListener("TrunkApplicationStarted", resolve, { once: true });
+        });
+
+        //const resp = await fetch("tot_fiori.ply.xz");
+        //const buf = await resp.arrayBuffer();
+        //window.wasmBindings.load_ply_xz(new Uint8Array(buf));
+
+        window.wasmBindings.load_toys();
+    </script>
 </body>
 </html>
