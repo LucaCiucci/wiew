@@ -1,0 +1,610 @@
+//! Experimental hierarchical point-cloud LOD.
+//!
+//! This is a CPU-side proof of concept for adaptive point-cloud rendering:
+//! internal octree nodes are rendered as representative surfels, while leaves
+//! are rendered as full point chunks.
+
+use std::cell::RefCell;
+
+use cgmath::{EuclideanSpace, InnerSpace, Matrix4, Point3, Vector3, Vector4};
+
+use crate::{
+    Pass, WCx,
+    drawable::Drawable,
+    mesh::{Color, Mesh, MeshStreamId, Normal, Position},
+    provided::pipelines::{ColoredSplatPipeline, FlatPipeline, LitMaterial},
+};
+
+#[derive(Debug, Clone)]
+pub struct PcLodConfig {
+    /// Stop splitting once a node reaches this depth.
+    pub max_depth: u32,
+    /// Stop splitting once a node contains at most this many points.
+    pub leaf_point_count: usize,
+    /// Render a node representative when its projected diameter is below this
+    /// threshold. Larger nodes descend into children or leaf chunks.
+    pub proxy_diameter_px: f32,
+}
+
+impl Default for PcLodConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 10,
+            leaf_point_count: 32_768,
+            proxy_diameter_px: 2.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PcLodPoint {
+    pub position: Position,
+    pub normal: Normal,
+    pub color: Color,
+}
+
+/// Hierarchical point-cloud renderer.
+///
+/// The current implementation is intentionally simple: tree selection runs on
+/// the CPU each frame, selected proxy surfels are copied into one dynamic mesh,
+/// and selected leaf chunks are drawn with the existing colored splat pipeline.
+pub struct PcLod {
+    config: PcLodConfig,
+    nodes: Vec<PcLodNode>,
+    root: Option<usize>,
+    total_points: usize,
+    leaf_meshes: Vec<Mesh>,
+    proxy_mesh: RefCell<Mesh>,
+    bounds_mesh: RefCell<Mesh>,
+    pipeline: ColoredSplatPipeline,
+    bounds_pipeline: FlatPipeline,
+    material: LitMaterial,
+    last_stats: RefCell<PcLodStats>,
+    draw_bounds: bool,
+}
+
+impl PcLod {
+    pub fn from_points(points: Vec<PcLodPoint>, config: PcLodConfig) -> Self {
+        let total_points = points.len();
+        let mut builder = PcLodBuilder {
+            config: config.clone(),
+            nodes: Vec::new(),
+            leaf_meshes: Vec::new(),
+        };
+        let root = if points.is_empty() {
+            None
+        } else {
+            Some(builder.build_node(points, 0))
+        };
+
+        Self {
+            config,
+            nodes: builder.nodes,
+            root,
+            total_points,
+            leaf_meshes: builder.leaf_meshes,
+            proxy_mesh: RefCell::new(dynamic_proxy_mesh()),
+            bounds_mesh: RefCell::new(dynamic_bounds_mesh()),
+            pipeline: ColoredSplatPipeline::new(),
+            bounds_pipeline: FlatPipeline::depthless_line_list(),
+            material: LitMaterial::leios_blue().with_front_color([1.0, 1.0, 1.0, 1.0]),
+            last_stats: RefCell::new(PcLodStats::default()),
+            draw_bounds: false,
+        }
+    }
+
+    pub fn from_streams(
+        positions: Vec<Position>,
+        normals: Vec<Normal>,
+        colors: Vec<Color>,
+        config: PcLodConfig,
+    ) -> Result<Self, PcLodBuildError> {
+        if positions.len() != normals.len() || positions.len() != colors.len() {
+            return Err(PcLodBuildError::LengthMismatch {
+                positions: positions.len(),
+                normals: normals.len(),
+                colors: colors.len(),
+            });
+        }
+
+        let points = positions
+            .into_iter()
+            .zip(normals)
+            .zip(colors)
+            .map(|((position, normal), color)| PcLodPoint {
+                position,
+                normal,
+                color,
+            })
+            .collect();
+        Ok(Self::from_points(points, config))
+    }
+
+    pub fn set_material(&mut self, material: LitMaterial) {
+        self.material = material;
+    }
+
+    pub fn material(&self) -> &LitMaterial {
+        &self.material
+    }
+
+    pub fn material_mut(&mut self) -> &mut LitMaterial {
+        &mut self.material
+    }
+
+    pub fn config(&self) -> &PcLodConfig {
+        &self.config
+    }
+
+    pub fn config_mut(&mut self) -> &mut PcLodConfig {
+        &mut self.config
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        self.leaf_meshes.len()
+    }
+
+    pub fn stats(&self) -> PcLodStats {
+        *self.last_stats.borrow()
+    }
+
+    pub fn draw_bounds(&self) -> bool {
+        self.draw_bounds
+    }
+
+    pub fn set_draw_bounds(&mut self, draw_bounds: bool) {
+        self.draw_bounds = draw_bounds;
+    }
+
+    fn select(&self, pass: &Pass) -> PcLodSelection {
+        let mut selection = PcLodSelection::default();
+        selection.stats.total_points = self.total_points;
+        selection.stats.total_nodes = self.nodes.len();
+        selection.stats.total_leaf_chunks = self.leaf_meshes.len();
+
+        let Some(root) = self.root else {
+            return selection;
+        };
+        let Some(trackball) = pass.trackball else {
+            self.collect_leaves(root, &mut selection.leaf_meshes);
+            return selection;
+        };
+
+        let size = pass.target().size();
+        let viewport = [size.width.max(1) as f32, size.height.max(1) as f32];
+        let view = trackball.view_matrix();
+        let proj = trackball.projection_matrix(viewport[0] / viewport[1]);
+        let view_proj = proj * view;
+        self.select_node(
+            root,
+            view,
+            view_proj,
+            viewport,
+            trackball.fov_y_deg,
+            &mut selection,
+        );
+        selection
+    }
+
+    fn collect_leaves(&self, node_id: usize, leaves: &mut Vec<usize>) {
+        let node = &self.nodes[node_id];
+        if let Some(leaf_mesh) = node.leaf_mesh {
+            leaves.push(leaf_mesh);
+            return;
+        }
+
+        for child in node.children.iter().flatten() {
+            self.collect_leaves(*child, leaves);
+        }
+    }
+
+    fn select_node(
+        &self,
+        node_id: usize,
+        view: Matrix4<f32>,
+        view_proj: Matrix4<f32>,
+        viewport: [f32; 2],
+        fov_y_deg: f32,
+        selection: &mut PcLodSelection,
+    ) {
+        selection.stats.visited_nodes += 1;
+        let node = &self.nodes[node_id];
+        if !node.bounds_may_be_visible(view_proj) {
+            selection.stats.culled_nodes += 1;
+            return;
+        }
+
+        let diameter_px = node.projected_diameter_px(view, viewport[1], fov_y_deg);
+        if diameter_px <= self.config.proxy_diameter_px {
+            selection.proxies.push(node.representative);
+            selection.bounds.push((node.bounds, PcLodBoundsKind::Proxy));
+            selection.stats.selected_proxy_points += 1;
+            return;
+        }
+
+        if let Some(leaf_mesh) = node.leaf_mesh {
+            selection.leaf_meshes.push(leaf_mesh);
+            selection.bounds.push((node.bounds, PcLodBoundsKind::Leaf));
+            return;
+        }
+
+        for child in node.children.iter().flatten() {
+            self.select_node(*child, view, view_proj, viewport, fov_y_deg, selection);
+        }
+    }
+}
+
+impl Drawable for PcLod {
+    fn draw(&self, cx: &mut WCx, pass: &mut Pass) {
+        let mut selection = self.select(pass);
+        selection.finish_stats(self);
+        *self.last_stats.borrow_mut() = selection.stats;
+
+        if !selection.proxies.is_empty() {
+            let mut positions = Vec::with_capacity(selection.proxies.len());
+            let mut normals = Vec::with_capacity(selection.proxies.len());
+            let mut colors = Vec::with_capacity(selection.proxies.len());
+            for proxy in selection.proxies {
+                positions.push(proxy.position);
+                normals.push(proxy.normal);
+                colors.push(proxy.color);
+            }
+            let mut proxy_mesh = self.proxy_mesh.borrow_mut();
+            proxy_mesh.set_positions(positions);
+            proxy_mesh.set_normals(normals);
+            proxy_mesh.set_colors(colors);
+            self.pipeline
+                .draw_mesh_with_material(cx, pass, &proxy_mesh, &self.material);
+        }
+
+        for leaf_mesh in selection.leaf_meshes {
+            if let Some(mesh) = self.leaf_meshes.get(leaf_mesh) {
+                self.pipeline
+                    .draw_mesh_with_material(cx, pass, mesh, &self.material);
+            }
+        }
+
+        if self.draw_bounds {
+            let (positions, colors) = bounds_lines(&selection.bounds);
+            let mut bounds_mesh = self.bounds_mesh.borrow_mut();
+            bounds_mesh.set_positions(positions);
+            bounds_mesh.set_colors(colors);
+            self.bounds_pipeline.draw_mesh(cx, pass, &bounds_mesh);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PcLodBuildError {
+    LengthMismatch {
+        positions: usize,
+        normals: usize,
+        colors: usize,
+    },
+}
+
+impl std::fmt::Display for PcLodBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                positions,
+                normals,
+                colors,
+            } => write!(
+                f,
+                "point-cloud stream length mismatch: positions={positions}, normals={normals}, colors={colors}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PcLodBuildError {}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PcLodStats {
+    pub total_points: usize,
+    pub total_nodes: usize,
+    pub total_leaf_chunks: usize,
+    pub visited_nodes: usize,
+    pub culled_nodes: usize,
+    pub selected_proxy_points: usize,
+    pub selected_leaf_chunks: usize,
+    pub selected_leaf_points: usize,
+}
+
+impl PcLodStats {
+    pub fn drawn_points(self) -> usize {
+        self.selected_proxy_points + self.selected_leaf_points
+    }
+}
+
+#[derive(Default)]
+struct PcLodSelection {
+    proxies: Vec<PcLodPoint>,
+    leaf_meshes: Vec<usize>,
+    bounds: Vec<(Aabb, PcLodBoundsKind)>,
+    stats: PcLodStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PcLodBoundsKind {
+    Proxy,
+    Leaf,
+}
+
+impl PcLodSelection {
+    fn finish_stats(&mut self, lod: &PcLod) {
+        self.stats.selected_proxy_points = self.proxies.len();
+        self.stats.selected_leaf_chunks = self.leaf_meshes.len();
+        self.stats.selected_leaf_points = self
+            .leaf_meshes
+            .iter()
+            .filter_map(|leaf| lod.leaf_meshes.get(*leaf))
+            .filter_map(|mesh| mesh.positions().len())
+            .sum();
+    }
+}
+
+struct PcLodBuilder {
+    config: PcLodConfig,
+    nodes: Vec<PcLodNode>,
+    leaf_meshes: Vec<Mesh>,
+}
+
+impl PcLodBuilder {
+    fn build_node(&mut self, points: Vec<PcLodPoint>, depth: u32) -> usize {
+        let bounds = Aabb::from_points(&points);
+        let representative = representative_point(&points);
+        let node_id = self.nodes.len();
+        self.nodes.push(PcLodNode {
+            bounds,
+            representative,
+            children: [None; 8],
+            leaf_mesh: None,
+        });
+
+        if depth >= self.config.max_depth || points.len() <= self.config.leaf_point_count {
+            let leaf_mesh = self.leaf_meshes.len();
+            self.leaf_meshes.push(mesh_from_points(points));
+            self.nodes[node_id].leaf_mesh = Some(leaf_mesh);
+            return node_id;
+        }
+
+        let center = bounds.center();
+        let mut children: [Vec<PcLodPoint>; 8] = std::array::from_fn(|_| Vec::new());
+        for point in points {
+            let child = octant(point.position, center);
+            children[child].push(point);
+        }
+
+        let mut any_child_split = false;
+        for (child_index, child_points) in children.into_iter().enumerate() {
+            if child_points.is_empty() {
+                continue;
+            }
+            any_child_split = true;
+            self.nodes[node_id].children[child_index] =
+                Some(self.build_node(child_points, depth + 1));
+        }
+
+        if !any_child_split {
+            self.nodes[node_id].leaf_mesh = Some(self.leaf_meshes.len());
+            self.leaf_meshes.push(Mesh::new(Vec::new()));
+        }
+
+        node_id
+    }
+}
+
+struct PcLodNode {
+    bounds: Aabb,
+    representative: PcLodPoint,
+    children: [Option<usize>; 8],
+    leaf_mesh: Option<usize>,
+}
+
+impl PcLodNode {
+    fn projected_diameter_px(
+        &self,
+        view: Matrix4<f32>,
+        viewport_height: f32,
+        fov_y_deg: f32,
+    ) -> f32 {
+        let center = self.bounds.center();
+        let view_center = view * Vector4::new(center.x, center.y, center.z, 1.0);
+        let radius = self.bounds.radius().max(0.0001);
+        let depth = (-view_center.z - radius).max(0.0001);
+        let focal_px = viewport_height * 0.5 / (fov_y_deg.to_radians() * 0.5).tan();
+        radius * 2.0 * focal_px / depth
+    }
+
+    fn bounds_may_be_visible(&self, view_proj: Matrix4<f32>) -> bool {
+        let mut all_left = true;
+        let mut all_right = true;
+        let mut all_below = true;
+        let mut all_above = true;
+        let mut all_before_near = true;
+        let mut all_after_far = true;
+
+        for corner in self.bounds.corners() {
+            let clip = view_proj * Vector4::new(corner.x, corner.y, corner.z, 1.0);
+
+            // Keep boxes that cross behind the eye. Homogeneous clipping around
+            // w <= 0 is easy to get subtly wrong, and overdraw is preferable to
+            // dropping visible chunks while zoomed into the cloud.
+            if clip.w <= 0.0 {
+                return true;
+            }
+
+            all_left &= clip.x < -clip.w;
+            all_right &= clip.x > clip.w;
+            all_below &= clip.y < -clip.w;
+            all_above &= clip.y > clip.w;
+            all_before_near &= clip.z < 0.0;
+            all_after_far &= clip.z > clip.w;
+        }
+
+        !(all_left || all_right || all_below || all_above || all_before_near || all_after_far)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Aabb {
+    min: Point3<f32>,
+    max: Point3<f32>,
+}
+
+impl Aabb {
+    fn from_points(points: &[PcLodPoint]) -> Self {
+        let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for point in points {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(point.position[axis]);
+                max[axis] = max[axis].max(point.position[axis]);
+            }
+        }
+        Self { min, max }
+    }
+
+    fn center(self) -> Point3<f32> {
+        Point3::from_vec((self.min.to_vec() + self.max.to_vec()) * 0.5)
+    }
+
+    fn radius(self) -> f32 {
+        (self.max - self.center()).magnitude()
+    }
+
+    fn corners(self) -> [Point3<f32>; 8] {
+        [
+            Point3::new(self.min.x, self.min.y, self.min.z),
+            Point3::new(self.max.x, self.min.y, self.min.z),
+            Point3::new(self.min.x, self.max.y, self.min.z),
+            Point3::new(self.max.x, self.max.y, self.min.z),
+            Point3::new(self.min.x, self.min.y, self.max.z),
+            Point3::new(self.max.x, self.min.y, self.max.z),
+            Point3::new(self.min.x, self.max.y, self.max.z),
+            Point3::new(self.max.x, self.max.y, self.max.z),
+        ]
+    }
+}
+
+fn representative_point(points: &[PcLodPoint]) -> PcLodPoint {
+    let mut position = Vector3::new(0.0, 0.0, 0.0);
+    let mut normal = Vector3::new(0.0, 0.0, 0.0);
+    let mut color = [0.0; 4];
+    let inv_len = 1.0 / points.len().max(1) as f32;
+
+    for point in points {
+        position += Vector3::new(point.position[0], point.position[1], point.position[2]);
+        normal += Vector3::new(point.normal[0], point.normal[1], point.normal[2]);
+        for (dst, src) in color.iter_mut().zip(point.color) {
+            *dst += src;
+        }
+    }
+
+    position *= inv_len;
+    normal = if normal.magnitude2() > 0.0 {
+        normal.normalize()
+    } else {
+        Vector3::unit_y()
+    };
+    for channel in &mut color {
+        *channel *= inv_len;
+    }
+
+    PcLodPoint {
+        position: position.into(),
+        normal: normal.into(),
+        color,
+    }
+}
+
+fn mesh_from_points(points: Vec<PcLodPoint>) -> Mesh {
+    let mut positions = Vec::with_capacity(points.len());
+    let mut normals = Vec::with_capacity(points.len());
+    let mut colors = Vec::with_capacity(points.len());
+    for point in points {
+        positions.push(point.position);
+        normals.push(point.normal);
+        colors.push(point.color);
+    }
+
+    Mesh::new(positions)
+        .with_normals(normals)
+        .with_colors(colors)
+}
+
+fn dynamic_proxy_mesh() -> Mesh {
+    let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+    Mesh::new_with_usage(usage, Vec::new())
+        .with_stream_usage(MeshStreamId::NORMAL, usage, Vec::<Normal>::new())
+        .with_stream_usage(MeshStreamId::COLOR, usage, Vec::<Color>::new())
+}
+
+fn dynamic_bounds_mesh() -> Mesh {
+    let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+    Mesh::new_with_usage(usage, Vec::new()).with_stream_usage(
+        MeshStreamId::COLOR,
+        usage,
+        Vec::<Color>::new(),
+    )
+}
+
+fn bounds_lines(bounds: &[(Aabb, PcLodBoundsKind)]) -> (Vec<Position>, Vec<Color>) {
+    let mut positions = Vec::with_capacity(bounds.len() * 24);
+    let mut colors = Vec::with_capacity(bounds.len() * 24);
+
+    for (bounds, kind) in bounds {
+        let color = match kind {
+            PcLodBoundsKind::Proxy => [0.15, 0.95, 1.0, 0.95],
+            PcLodBoundsKind::Leaf => [1.0, 0.85, 0.10, 0.75],
+        };
+        let corners = bounds.corners();
+        for (a, b) in AABB_EDGES {
+            positions.push(point_to_position(corners[a]));
+            positions.push(point_to_position(corners[b]));
+            colors.push(color);
+            colors.push(color);
+        }
+    }
+
+    (positions, colors)
+}
+
+const AABB_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+
+fn point_to_position(point: Point3<f32>) -> Position {
+    [point.x, point.y, point.z]
+}
+
+fn octant(position: Position, center: Point3<f32>) -> usize {
+    let mut index = 0;
+    if position[0] >= center.x {
+        index |= 1;
+    }
+    if position[1] >= center.y {
+        index |= 2;
+    }
+    if position[2] >= center.z {
+        index |= 4;
+    }
+    index
+}

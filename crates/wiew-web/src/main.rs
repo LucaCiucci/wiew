@@ -82,8 +82,8 @@ impl App {
         let device = render_state.device.clone();
         let queue = render_state.queue.clone();
 
-        let view = EguiView3d::new(device, queue, 900, 600, 5.0)
-            .with_texture_name("wiew web scene");
+        let view =
+            EguiView3d::new(device, queue, 900, 600, 5.0).with_texture_name("wiew web scene");
 
         let point_cloud = load_embedded_points();
         let ply_mesh = load_ply_points();
@@ -100,10 +100,9 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let tex_id = self.view.render_to_egui(
-            &self.render_state,
-            |cx, pass| self.scene.render(cx, pass, self.colors),
-        );
+        let tex_id = self.view.render_to_egui(&self.render_state, |cx, pass| {
+            self.scene.render(cx, pass, self.colors)
+        });
 
         egui::Panel::top("header").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -291,12 +290,8 @@ impl Scene {
                 &self.point_material,
             );
         }
-        self.point_pipeline.draw_mesh_with_material(
-            cx,
-            pass,
-            &self.ply_mesh,
-            &self.ply_material,
-        );
+        self.point_pipeline
+            .draw_mesh_with_material(cx, pass, &self.ply_mesh, &self.ply_material);
         pass.draw(cx, &self.gizmo);
     }
 }

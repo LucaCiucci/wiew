@@ -60,8 +60,12 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn new(positions: Vec<Position>) -> Self {
+        Self::new_with_usage(wgpu::BufferUsages::VERTEX, positions)
+    }
+
+    pub fn new_with_usage(usage: wgpu::BufferUsages, positions: Vec<Position>) -> Self {
         Self {
-            positions: Buf::new(wgpu::BufferUsages::VERTEX, positions),
+            positions: Buf::new(usage, positions),
             indices: None,
             streams: HashMap::new(),
         }
@@ -79,6 +83,16 @@ impl Mesh {
 
     pub fn with_stream<T: BufElement>(mut self, id: MeshStreamId, data: Vec<T>) -> Self {
         self.insert_stream(id, data);
+        self
+    }
+
+    pub fn with_stream_usage<T: BufElement>(
+        mut self,
+        id: MeshStreamId,
+        usage: wgpu::BufferUsages,
+        data: Vec<T>,
+    ) -> Self {
+        self.insert_stream_with_usage(id, usage, data);
         self
     }
 
@@ -147,11 +161,19 @@ impl Mesh {
     }
 
     pub fn insert_stream<T: BufElement>(&mut self, id: MeshStreamId, data: Vec<T>) {
+        self.insert_stream_with_usage(id, wgpu::BufferUsages::VERTEX, data);
+    }
+
+    pub fn insert_stream_with_usage<T: BufElement>(
+        &mut self,
+        id: MeshStreamId,
+        usage: wgpu::BufferUsages,
+        data: Vec<T>,
+    ) {
         if let Some(current) = self.stream::<T>(id) {
             current.set_data(data);
         } else {
-            self.streams
-                .insert(id, Box::new(Buf::new(wgpu::BufferUsages::VERTEX, data)));
+            self.streams.insert(id, Box::new(Buf::new(usage, data)));
         }
     }
 

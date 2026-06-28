@@ -12,8 +12,12 @@ use std::{
 
 use eframe::egui;
 use wiew::{
-    Pass, WCx, egui_view::EguiView3d, mesh::{Color, Mesh, Normal, Position}, provided::{
-        Grid, QuadBackground, QuadBackgroundConfig, TrackballGizmo, pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
+    Pass, WCx,
+    egui_view::EguiView3d,
+    mesh::{Color, Mesh, Normal, Position},
+    provided::{
+        Grid, PcLod, PcLodConfig, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
+        pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
     },
 };
 
@@ -46,12 +50,12 @@ impl App {
         let device = render_state.device.clone();
         let queue = render_state.queue.clone();
 
-        let view = EguiView3d::new(device, queue, 900, 600, 5.0)
-            .with_texture_name("points file scene");
+        let view =
+            EguiView3d::new(device, queue, 900, 600, 5.0).with_texture_name("points file scene");
         let point_cloud =
             load_points_file(&points_file_path()).expect("failed to load points_6.txt");
-        let ply_mesh = load_ply_points().expect("failed to load tot.ply");
-        let scene = Scene::new(point_cloud, ply_mesh);
+        let ply_lod = load_ply_points().expect("failed to load tot.ply");
+        let scene = Scene::new(point_cloud, ply_lod);
 
         Self {
             view,
@@ -64,10 +68,9 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let tex_id = self.view.render_to_egui(
-            &self.render_state,
-            |cx, pass| self.scene.render(cx, pass, self.colors),
-        );
+        let tex_id = self.view.render_to_egui(&self.render_state, |cx, pass| {
+            self.scene.render(cx, pass, self.colors)
+        });
 
         egui::Panel::top("header").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -104,7 +107,14 @@ impl eframe::App for App {
             .show_inside(ui, |ui| {
                 ui.heading("Material");
                 ui.separator();
-                material_ui(ui, &mut self.colors, &mut self.scene.point_material, &mut self.scene.point_colored_material);
+                material_ui(
+                    ui,
+                    &mut self.colors,
+                    &mut self.scene.point_material,
+                    &mut self.scene.point_colored_material,
+                );
+                ui.separator();
+                lod_ui(ui, &mut self.scene.ply_lod);
             });
 
         let desired = self.view.central_panel_interactive(ui, tex_id);
@@ -112,7 +122,12 @@ impl eframe::App for App {
     }
 }
 
-fn material_ui(ui: &mut egui::Ui, colors: &mut bool, mono_mat: &mut LitMaterial, color_mat: &mut LitMaterial) {
+fn material_ui(
+    ui: &mut egui::Ui,
+    colors: &mut bool,
+    mono_mat: &mut LitMaterial,
+    color_mat: &mut LitMaterial,
+) {
     let mat = if *colors { color_mat } else { mono_mat };
 
     egui::Grid::new("material_grid")
@@ -194,26 +209,87 @@ fn material_ui(ui: &mut egui::Ui, colors: &mut bool, mono_mat: &mut LitMaterial,
     }
 }
 
+fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
+    ui.heading("PLY LOD");
+    let mut draw_bounds = lod.draw_bounds();
+    if ui
+        .checkbox(&mut draw_bounds, "Draw selected boxes")
+        .changed()
+    {
+        lod.set_draw_bounds(draw_bounds);
+    }
+
+    let mut proxy_diameter_px = lod.config().proxy_diameter_px;
+    if ui
+        .add(
+            egui::Slider::new(&mut proxy_diameter_px, 0.5..=128.0)
+                .logarithmic(true)
+                .text("Proxy px"),
+        )
+        .changed()
+    {
+        lod.config_mut().proxy_diameter_px = proxy_diameter_px;
+    }
+
+    let stats = lod.stats();
+    let drawn = stats.drawn_points();
+    let percent = if stats.total_points > 0 {
+        drawn as f64 * 100.0 / stats.total_points as f64
+    } else {
+        0.0
+    };
+
+    egui::Grid::new("pc_lod_stats")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Tree");
+            ui.label(format!(
+                "{} nodes / {} leaves",
+                stats.total_nodes, stats.total_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Visited");
+            ui.label(format!(
+                "{} nodes ({} culled)",
+                stats.visited_nodes, stats.culled_nodes
+            ));
+            ui.end_row();
+
+            ui.label("Selected");
+            ui.label(format!(
+                "{} proxies / {} leaves",
+                stats.selected_proxy_points, stats.selected_leaf_chunks
+            ));
+            ui.end_row();
+
+            ui.label("Drawn");
+            ui.label(format!(
+                "{} / {} pts ({percent:.1}%)",
+                drawn, stats.total_points
+            ));
+            ui.end_row();
+        });
+}
+
 struct Scene {
     bg: QuadBackground,
     grid: Grid,
     gizmo: TrackballGizmo,
     point_cloud: Mesh,
     point_count: usize,
-    ply_mesh: Mesh,
+    ply_lod: PcLod,
     ply_count: usize,
     point_pipeline: SplatPipeline,
     point_colored_pipeline: ColoredSplatPipeline,
     point_material: LitMaterial,
     point_colored_material: LitMaterial,
-    ply_material: LitMaterial,
 }
 
 impl Scene {
-    fn new(point_cloud: LoadedPointCloud, ply_mesh: LoadedPointCloud) -> Self {
+    fn new(point_cloud: LoadedPointCloud, mut ply_lod: LoadedPointCloudLod) -> Self {
         let point_count = point_cloud.point_count;
-        let point_material = LitMaterial::leios_blue()
-            .with_point_size(0.003);
+        let point_material = LitMaterial::leios_blue().with_point_size(0.003);
         let point_colored_material = LitMaterial::leios_blue()
             .with_front_color([1.0, 1.0, 1.0, 1.0])
             .with_point_size(0.003);
@@ -221,6 +297,7 @@ impl Scene {
             .with_front_color([1.0, 0.3, 0.3, 1.0])
             .with_back_color([0.5, 0.1, 0.1, 1.0])
             .with_point_size(0.001);
+        ply_lod.lod.set_material(ply_material);
 
         Self {
             bg: QuadBackground::new(QuadBackgroundConfig::default()),
@@ -228,13 +305,12 @@ impl Scene {
             gizmo: TrackballGizmo::new(),
             point_cloud: point_cloud.mesh,
             point_count,
-            ply_mesh: ply_mesh.mesh,
-            ply_count: ply_mesh.point_count,
+            ply_lod: ply_lod.lod,
+            ply_count: ply_lod.point_count,
             point_pipeline: SplatPipeline::new(),
             point_colored_pipeline: ColoredSplatPipeline::new(),
             point_material,
             point_colored_material,
-            ply_material,
         }
     }
 
@@ -256,18 +332,18 @@ impl Scene {
                 &self.point_material,
             );
         }
-        self.point_pipeline.draw_mesh_with_material(
-            cx,
-            pass,
-            &self.ply_mesh,
-            &self.ply_material,
-        );
+        pass.draw(cx, &self.ply_lod);
         pass.draw(cx, &self.gizmo);
     }
 }
 
 struct LoadedPointCloud {
     mesh: Mesh,
+    point_count: usize,
+}
+
+struct LoadedPointCloudLod {
+    lod: PcLod,
     point_count: usize,
 }
 
@@ -359,11 +435,13 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// PLY file loader — reads first 100 vertices from tot.ply
+// PLY file loader for binary little-endian x y z nx ny nz vertex data.
 // ---------------------------------------------------------------------------
 
 fn ply_file_path() -> PathBuf {
-    let cwd_path = PathBuf::from("tot_fiori.ply");
+    //let cwd_path = PathBuf::from("tot.ply");
+    //let cwd_path = PathBuf::from("tot_fiori.ply");
+    let cwd_path = PathBuf::from("punti_fibbia.ply");
     if cwd_path.exists() {
         return cwd_path;
     }
@@ -372,7 +450,7 @@ fn ply_file_path() -> PathBuf {
         .join("tot.ply")
 }
 
-fn load_ply_points() -> Result<LoadedPointCloud, Box<dyn Error>> {
+fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
     let mut file = File::open(ply_file_path())?;
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)?;
@@ -390,8 +468,9 @@ fn load_ply_points() -> Result<LoadedPointCloud, Box<dyn Error>> {
     let data = &raw[header_end..];
     let count = (data.len() / VERTEX_STRIDE).min(MAX_PLY_POINTS);
 
-    let mut positions = Vec::<Position>::new();
-    let mut normals = Vec::<Normal>::new();
+    let mut positions = Vec::<Position>::with_capacity(count);
+    let mut normals = Vec::<Normal>::with_capacity(count);
+    let mut colors = Vec::<Color>::with_capacity(count);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
 
@@ -415,6 +494,11 @@ fn load_ply_points() -> Result<LoadedPointCloud, Box<dyn Error>> {
         }
         positions.push(position);
         normals.push(normal);
+        colors.push([1.0, 1.0, 1.0, 1.0]);
+    }
+
+    if positions.is_empty() {
+        return Err("PLY file contains no readable points".into());
     }
 
     let center = [
@@ -436,10 +520,17 @@ fn load_ply_points() -> Result<LoadedPointCloud, Box<dyn Error>> {
     }
 
     let point_count = positions.len();
-    Ok(LoadedPointCloud {
-        mesh: Mesh::new(positions).with_normals(normals),
-        point_count,
-    })
+    let lod = PcLod::from_streams(
+        positions,
+        normals,
+        colors,
+        PcLodConfig {
+            leaf_point_count: 65_536 / 64,
+            proxy_diameter_px: 2.5 * 2.0,
+            max_depth: 14,
+        },
+    )?;
+    Ok(LoadedPointCloudLod { lod, point_count })
 }
 
 fn parse_color(r: f32, g: f32, b: f32, a: f32) -> [f32; 4] {
