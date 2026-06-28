@@ -16,7 +16,7 @@ use wiew::{
     egui_view::EguiView3d,
     mesh::{Color, Mesh, Normal, Position},
     provided::{
-        Grid, PcLod, PcLodConfig, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
+        Grid, PcLod, QuadBackground, QuadBackgroundConfig, TrackballGizmo,
         pipelines::{ColoredSplatPipeline, LitMaterial, SplatPipeline},
     },
 };
@@ -243,6 +243,18 @@ fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
         lod.config_mut().points_per_pixel = points_per_pixel;
     }
 
+    let mut node_lod_point_count = lod.config().node_lod_point_count;
+    if ui
+        .add(
+            egui::Slider::new(&mut node_lod_point_count, 512..=65_536)
+                .logarithmic(true)
+                .text("Node pts"),
+        )
+        .changed()
+    {
+        lod.config_mut().node_lod_point_count = node_lod_point_count;
+    }
+
     let stats = lod.stats();
     let drawn = stats.drawn_points();
     let percent = if stats.total_points > 0 {
@@ -270,8 +282,10 @@ fn lod_ui(ui: &mut egui::Ui, lod: &mut PcLod) {
 
             ui.label("Selected");
             ui.label(format!(
-                "{} proxies / {} leaves",
-                stats.selected_proxy_points, stats.selected_leaf_chunks
+                "{} proxies / {} node LODs / {} leaves",
+                stats.selected_proxy_points,
+                stats.selected_node_lod_chunks,
+                stats.selected_leaf_chunks
             ));
             ui.end_row();
 
@@ -458,23 +472,19 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 // ---------------------------------------------------------------------------
 
 fn ply_file_paths() -> Vec<PathBuf> {
-    [
-        "tot.ply",
-        "tot_fiori.ply",
-        "punti_fibbia.ply",
-    ]
-    .into_iter()
-    .map(|file| {
-        let cwd_path = PathBuf::from(file);
-        if cwd_path.exists() {
-            cwd_path
-        } else {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(file)
-        }
-    })
-    .collect()
+    ["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
+        .into_iter()
+        .map(|file| {
+            let cwd_path = PathBuf::from(file);
+            if cwd_path.exists() {
+                cwd_path
+            } else {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(file)
+            }
+        })
+        .collect()
 }
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
@@ -532,12 +542,7 @@ fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
         positions,
         normals,
         colors,
-        PcLodConfig {
-            leaf_point_count: 65_536,
-            proxy_diameter_px: 2.5,
-            points_per_pixel: 1.05,
-            max_depth: 14,
-        },
+        Default::default(),
     )?;
     Ok(LoadedPointCloudLod { lod, point_count })
 }

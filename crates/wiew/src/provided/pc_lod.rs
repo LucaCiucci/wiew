@@ -16,45 +16,13 @@ use crate::{
     provided::pipelines::{ColoredSplatPipeline, FlatPipeline, LitMaterial},
 };
 
-const LEAF_LOD_TARGETS: [usize; 5] = [512, 2_048, 8_192, 32_768, 131_072];
+mod config;
+mod point;
 
-#[derive(Debug, Clone)]
-pub struct PcLodConfig {
-    /// Stop splitting once a node reaches this depth.
-    pub max_depth: u32,
-    /// Stop splitting once a node contains at most this many points.
-    pub leaf_point_count: usize,
-    /// Render a node representative when its projected diameter is below this
-    /// threshold. Larger nodes descend into children or leaf chunks.
-    pub proxy_diameter_px: f32,
-    /// Desired point density for selected leaf chunks. Higher values draw more
-    /// points per screen pixel; lower values favor coarser leaf payloads.
-    pub points_per_pixel: f32,
-}
-
-impl Default for PcLodConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: 10,
-            leaf_point_count: 32_768,
-            proxy_diameter_px: 2.5,
-            points_per_pixel: 0.05,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PcLodPoint {
-    pub position: Position,
-    pub normal: Normal,
-    pub color: Color,
-}
+pub use config::*;
+pub use point::*;
 
 /// Hierarchical point-cloud renderer.
-///
-/// The current implementation is intentionally simple: tree selection runs on
-/// the CPU each frame, selected proxy surfels are copied into one dynamic mesh,
-/// and selected leaf chunks are drawn with the existing colored splat pipeline.
 pub struct PcLod {
     config: PcLodConfig,
     nodes: Vec<PcLodNode>,
@@ -62,6 +30,7 @@ pub struct PcLod {
     total_points: usize,
     leaf_meshes: Vec<Mesh>,
     leaf_lods: Vec<Vec<Mesh>>,
+    node_lods: Vec<Vec<Mesh>>,
     proxy_mesh: RefCell<Mesh>,
     bounds_mesh: RefCell<Mesh>,
     pipeline: ColoredSplatPipeline,
@@ -79,6 +48,7 @@ impl PcLod {
             nodes: Vec::new(),
             leaf_meshes: Vec::new(),
             leaf_lods: Vec::new(),
+            node_lods: Vec::new(),
         };
         let root = if points.is_empty() {
             None
@@ -93,6 +63,7 @@ impl PcLod {
             total_points,
             leaf_meshes: builder.leaf_meshes,
             leaf_lods: builder.leaf_lods,
+            node_lods: builder.node_lods,
             proxy_mesh: RefCell::new(dynamic_proxy_mesh()),
             bounds_mesh: RefCell::new(dynamic_bounds_mesh()),
             pipeline: ColoredSplatPipeline::new(),
@@ -103,30 +74,16 @@ impl PcLod {
         }
     }
 
+    /// A convenience constructor for building a [`PcLod`] from separate point streams.
+    ///
+    /// This simply combines [`PcLodPoint::from_streams`] and [`PcLod::from_points`].
     pub fn from_streams(
         positions: Vec<Position>,
         normals: Vec<Normal>,
         colors: Vec<Color>,
         config: PcLodConfig,
     ) -> Result<Self, PcLodBuildError> {
-        if positions.len() != normals.len() || positions.len() != colors.len() {
-            return Err(PcLodBuildError::LengthMismatch {
-                positions: positions.len(),
-                normals: normals.len(),
-                colors: colors.len(),
-            });
-        }
-
-        let points = positions
-            .into_iter()
-            .zip(normals)
-            .zip(colors)
-            .map(|((position, normal), color)| PcLodPoint {
-                position,
-                normal,
-                color,
-            })
-            .collect();
+        let points = PcLodPoint::from_streams(positions, normals, colors)?.collect();
         Ok(Self::from_points(points, config))
     }
 
@@ -239,6 +196,19 @@ impl PcLod {
             return;
         }
 
+        if node.leaf_mesh.is_none()
+            && let Some(lod) = self.node_lod_for(node, screen_rect)
+        {
+            selection.node_lods.push(SelectedNodeLod {
+                node_lods: lod.node_lods,
+                lod: lod.lod,
+            });
+            selection
+                .bounds
+                .push((node.bounds, PcLodBoundsKind::NodeLod));
+            return;
+        }
+
         if let Some(leaf_mesh) = node.leaf_mesh {
             selection.leaf_meshes.push(SelectedLeafMesh {
                 leaf: leaf_mesh,
@@ -251,6 +221,25 @@ impl PcLod {
         for child in node.children.iter().flatten() {
             self.select_node(*child, view, view_proj, viewport, fov_y_deg, selection);
         }
+    }
+
+    fn node_lod_for(&self, node: &PcLodNode, screen_rect: ScreenRect) -> Option<SelectedNodeLod> {
+        let node_lods = node.node_lods?;
+        let lods = self.node_lods.get(node_lods)?;
+        let desired_points = (screen_rect.area() * self.config.points_per_pixel)
+            .ceil()
+            .clamp(1.0, node.point_count as f32) as usize;
+
+        lods.iter().enumerate().find_map(|(index, mesh)| {
+            let count = mesh.vertex_count().unwrap_or_default();
+            (count <= self.config.node_lod_point_count
+                && count >= desired_points
+                && count < node.point_count)
+                .then_some(SelectedNodeLod {
+                    node_lods,
+                    lod: index,
+                })
+        })
     }
 
     fn leaf_lod_for(&self, leaf: usize, screen_rect: ScreenRect) -> Option<usize> {
@@ -298,6 +287,17 @@ impl Drawable for PcLod {
             proxy_mesh.set_colors(colors);
             self.pipeline
                 .draw_mesh_with_material(cx, pass, &proxy_mesh, &self.material);
+        }
+
+        for selected in selection.node_lods {
+            if let Some(mesh) = self
+                .node_lods
+                .get(selected.node_lods)
+                .and_then(|lods| lods.get(selected.lod))
+            {
+                self.pipeline
+                    .draw_mesh_with_material(cx, pass, mesh, &self.material);
+            }
         }
 
         for leaf_mesh in selection.leaf_meshes {
@@ -358,6 +358,8 @@ pub struct PcLodStats {
     pub visited_nodes: usize,
     pub culled_nodes: usize,
     pub selected_proxy_points: usize,
+    pub selected_node_lod_chunks: usize,
+    pub selected_node_lod_points: usize,
     pub selected_leaf_chunks: usize,
     pub selected_leaf_points: usize,
     pub selected_leaf_lod_chunks: usize,
@@ -366,16 +368,23 @@ pub struct PcLodStats {
 
 impl PcLodStats {
     pub fn drawn_points(self) -> usize {
-        self.selected_proxy_points + self.selected_leaf_points
+        self.selected_proxy_points + self.selected_node_lod_points + self.selected_leaf_points
     }
 }
 
 #[derive(Default)]
 struct PcLodSelection {
     proxies: Vec<PcLodPoint>,
+    node_lods: Vec<SelectedNodeLod>,
     leaf_meshes: Vec<SelectedLeafMesh>,
     bounds: Vec<(Aabb, PcLodBoundsKind)>,
     stats: PcLodStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedNodeLod {
+    node_lods: usize,
+    lod: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,12 +396,24 @@ struct SelectedLeafMesh {
 #[derive(Debug, Clone, Copy)]
 enum PcLodBoundsKind {
     Proxy,
+    NodeLod,
     Leaf,
 }
 
 impl PcLodSelection {
     fn finish_stats(&mut self, lod: &PcLod) {
         self.stats.selected_proxy_points = self.proxies.len();
+        self.stats.selected_node_lod_chunks = self.node_lods.len();
+        self.stats.selected_node_lod_points = self
+            .node_lods
+            .iter()
+            .filter_map(|selected| {
+                lod.node_lods
+                    .get(selected.node_lods)
+                    .and_then(|node_lods| node_lods.get(selected.lod))
+            })
+            .filter_map(|mesh| mesh.positions().len())
+            .sum();
         self.stats.selected_leaf_chunks = self.leaf_meshes.len();
         self.stats.selected_leaf_lod_chunks = self
             .leaf_meshes
@@ -421,16 +442,21 @@ struct PcLodBuilder {
     nodes: Vec<PcLodNode>,
     leaf_meshes: Vec<Mesh>,
     leaf_lods: Vec<Vec<Mesh>>,
+    node_lods: Vec<Vec<Mesh>>,
 }
 
 impl PcLodBuilder {
     fn build_node(&mut self, points: Vec<PcLodPoint>, depth: u32) -> usize {
         let bounds = Aabb::from_points(&points);
         let representative = representative_point(&points);
+        let point_count = points.len();
+        let node_lods = self.node_lods_from_points(&points);
         let node_id = self.nodes.len();
         self.nodes.push(PcLodNode {
             bounds,
             representative,
+            point_count,
+            node_lods,
             children: [None; 8],
             leaf_mesh: None,
         });
@@ -468,11 +494,30 @@ impl PcLodBuilder {
 
         node_id
     }
+
+    fn node_lods_from_points(&mut self, points: &[PcLodPoint]) -> Option<usize> {
+        let min_source_points = self.config.leaf_point_count.saturating_mul(4).max(1);
+        if points.len() < min_source_points || self.config.node_lod_point_count == 0 {
+            return None;
+        }
+
+        let max_target = self.config.node_lod_point_count.min(points.len() / 2);
+        let lods = point_lods_from_targets(points, &NODE_LOD_TARGETS, max_target);
+        if lods.is_empty() {
+            return None;
+        }
+
+        let index = self.node_lods.len();
+        self.node_lods.push(lods);
+        Some(index)
+    }
 }
 
 struct PcLodNode {
     bounds: Aabb,
     representative: PcLodPoint,
+    point_count: usize,
+    node_lods: Option<usize>,
     children: [Option<usize>; 8],
     leaf_mesh: Option<usize>,
 }
@@ -656,11 +701,20 @@ fn mesh_from_points(points: Vec<PcLodPoint>) -> Mesh {
 }
 
 fn leaf_lods_from_points(points: &[PcLodPoint]) -> Vec<Mesh> {
+    point_lods_from_targets(points, &LEAF_LOD_TARGETS, points.len().saturating_sub(1))
+}
+
+fn point_lods_from_targets(
+    points: &[PcLodPoint],
+    targets: &[usize],
+    max_target: usize,
+) -> Vec<Mesh> {
     let mut lods = Vec::new();
     let mut last_count = 0usize;
 
-    for target in LEAF_LOD_TARGETS {
-        if target >= points.len() {
+    for target in targets {
+        let target = (*target).min(max_target);
+        if target == 0 || target >= points.len() {
             break;
         }
 
@@ -710,6 +764,7 @@ fn bounds_lines(bounds: &[(Aabb, PcLodBoundsKind)]) -> (Vec<Position>, Vec<Color
     for (bounds, kind) in bounds {
         let color = match kind {
             PcLodBoundsKind::Proxy => [0.15, 0.95, 1.0, 0.95],
+            PcLodBoundsKind::NodeLod => [1.0, 0.45, 0.0, 0.85],
             PcLodBoundsKind::Leaf => [1.0, 0.85, 0.10, 0.75],
         };
         let corners = bounds.corners();

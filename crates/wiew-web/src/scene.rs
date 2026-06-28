@@ -1,6 +1,4 @@
-use wiew::{
-    provided::{Grid, PcLod, QuadBackground, QuadBackgroundConfig, TrackballGizmo},
-};
+use wiew::provided::{Grid, PcLod, QuadBackground, QuadBackgroundConfig, TrackballGizmo};
 
 use crate::{ADDITIONAL_OBJECTS, loader::PENDING_LOD};
 

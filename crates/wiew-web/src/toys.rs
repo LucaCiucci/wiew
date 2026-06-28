@@ -1,6 +1,9 @@
 use wasm_bindgen::prelude::*;
 use wiew::{
-    Pass, WCx, drawable::Drawable, mesh::{Mesh, Normal, Position}, provided::pipelines::{LitMaterial, LitPipeline},
+    Pass, WCx,
+    drawable::Drawable,
+    mesh::{Mesh, Normal, Position},
+    provided::pipelines::{LitMaterial, LitPipeline},
 };
 
 use crate::{ADDITIONAL_OBJECTS, CTX};
