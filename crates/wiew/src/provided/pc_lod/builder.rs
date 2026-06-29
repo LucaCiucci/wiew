@@ -11,7 +11,9 @@ pub(super) struct PcLodBuilder {
 }
 
 impl PcLodBuilder {
+    /// Build a point cloud LOD tree from a set of points.
     pub fn build_node(&mut self, points: Vec<PcLodPoint>, depth: u32) -> usize {
+        // Create a new node and add it to the nodes vector.
         let node_id = self.nodes.len();
         let node = PcLodNode::init(&self.config, &points, &mut self.node_lods);
         let bounds = node.bounds;
@@ -50,4 +52,8 @@ impl PcLodBuilder {
 
         node_id
     }
+}
+
+fn leaf_lods_from_points(points: &[PcLodPoint]) -> Vec<Mesh> {
+    point_lods_from_targets(points, &LEAF_LOD_TARGETS, points.len().saturating_sub(1))
 }

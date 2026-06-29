@@ -2,6 +2,7 @@ use crate::common::utils::project;
 
 use super::*;
 
+/// A node in a point cloud LOD tree.
 pub(super) struct PcLodNode {
     pub bounds: Aabb,
     pub representative: PcLodPoint,
@@ -14,8 +15,8 @@ pub(super) struct PcLodNode {
 impl PcLodNode {
     /// Initialize a new [`PcLodNode`] from a set of points.
     ///
-    /// This computes the bounding box, representative point, and node LODs. It
-    /// does not split into children or create leaf meshes; that is done by the
+    /// This computes the **bounding box**, **representative point**, and **node LODs**.
+    /// It **does not** split into children or create leaf meshes; that is done by the
     /// [`PcLodBuilder`].
     pub fn init(
         config: &PcLodConfig,
@@ -125,4 +126,63 @@ impl PcLodNode {
         node_lods.push(lods);
         Some(index)
     }
+}
+
+/// Compute a representative point for a set of points.
+///
+/// This is done by **averaging** their **positions and properties**.
+fn representative_point(points: &[PcLodPoint]) -> PcLodPoint {
+    let mut position = Vector3::new(0.0, 0.0, 0.0);
+    let mut normal = Vector3::new(0.0, 0.0, 0.0);
+    let mut color = [0.0; 4];
+    let inv_len = 1.0 / points.len().max(1) as f32;
+
+    for point in points {
+        position += Vector3::new(point.position[0], point.position[1], point.position[2]);
+        normal += Vector3::new(point.normal[0], point.normal[1], point.normal[2]);
+        for (dst, src) in color.iter_mut().zip(point.color) {
+            *dst += src;
+        }
+    }
+
+    position *= inv_len;
+    normal = if normal.magnitude2() > 0.0 {
+        normal.normalize()
+    } else {
+        Vector3::unit_y()
+    };
+    for channel in &mut color {
+        *channel *= inv_len;
+    }
+
+    PcLodPoint {
+        position: position.into(),
+        normal: normal.into(),
+        color,
+    }
+}
+
+pub(super) fn point_lods_from_targets(
+    points: &[PcLodPoint],
+    targets: &[usize],
+    max_target: usize,
+) -> Vec<Mesh> {
+    let mut lods = Vec::new();
+    let mut last_count = 0usize;
+
+    for target in targets {
+        let target = (*target).min(max_target);
+        if target == 0 || target >= points.len() {
+            break;
+        }
+
+        let sampled = sample_points(points, target);
+        if sampled.len() == last_count || sampled.len() >= points.len() {
+            continue;
+        }
+        last_count = sampled.len();
+        lods.push(mesh_from_points(sampled));
+    }
+
+    lods
 }
