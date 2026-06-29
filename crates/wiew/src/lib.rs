@@ -11,6 +11,7 @@ pub mod readback;
 pub mod render_target;
 pub mod resource;
 pub mod view;
+pub mod common;
 
 pub use buf::*;
 pub use context::*;
