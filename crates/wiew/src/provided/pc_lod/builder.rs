@@ -1,7 +1,32 @@
 use crate::mesh::Mesh;
 use super::*;
 
-
+/// Builder for a point cloud LOD tree.
+///
+/// This struct is responsible for constructing a level-of-detail (LOD) tree
+/// from a set of points. It manages the creation of nodes, leaves, and their
+/// associated meshes and LODs.
+///
+/// # Procedure
+///
+/// The builder follows a recursive approach to build the LOD tree:
+/// 1. **Node Initialization**: For each set of points, a new node is
+///    initialized, computing its bounding box, representative point, and node
+///    LODs.
+/// 2. **Splitting Decision**: The builder checks if the node should be split
+///    further based on the configuration parameters (maximum depth and leaf
+///    point count):
+///    1. **Child Partitioning**: If splitting is required, the points are
+///      partitioned into 8 octants corresponding to the child nodes.
+///    2. **Recursive Child Building**: Each child node is built recursively,
+///      and the parent node keeps track of its children. If no children are
+///      created, the node is converted into a leaf with no points.
+/// 3. **Leaf Construction**: If a node is determined to be a leaf, the builder
+///    constructs the leaf mesh and its LODs from the points.
+///
+/// This procedure is taken care of by the [`build_node`](Self::build_node)
+/// method, which is the main entry point for building the LOD tree from a set
+/// of points.
 pub(super) struct PcLodBuilder {
     pub config: PcLodConfig,
     pub nodes: Vec<PcLodNode>,
@@ -14,7 +39,8 @@ impl PcLodBuilder {
     /// Build a point cloud LOD tree from a set of points.
     ///
     /// This is the main entry point for building a [`PcLod`] from a set of points.
-    /// It creates a new [`PcLodBuilder`], builds the tree, and returns the resulting [`PcLod`].
+    ///
+    /// See [`PcLodBuilder`] for an overview of the building procedure.
     pub fn build_node(&mut self, points: Vec<PcLodPoint>, depth: u32) -> usize {
         let (node_id, bounds) = self.init_node(&points);
 
