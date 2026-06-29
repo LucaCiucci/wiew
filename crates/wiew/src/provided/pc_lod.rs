@@ -21,12 +21,15 @@ mod config;
 mod point;
 mod builder;
 mod node;
+mod aabb;
+mod drawing;
 
 pub use cache::{PC_LOD_PAYLOAD_CHUNK_SIZE, PcLodCacheParts, PcLodPayloadChunkRequest};
 pub use config::*;
 pub use point::*;
 use builder::*;
 use node::*;
+use aabb::*;
 
 /// Hierarchical point-cloud renderer.
 pub struct PcLod {
@@ -395,64 +398,6 @@ impl PcLod {
     }
 }
 
-impl Drawable for PcLod {
-    fn draw(&self, cx: &mut WCx, pass: &mut Pass) {
-        let mut selection = self.select(pass);
-        selection.finish_stats(self);
-        *self.last_stats.borrow_mut() = selection.stats;
-
-        if !selection.proxies.is_empty() {
-            let mut positions = Vec::with_capacity(selection.proxies.len());
-            let mut normals = Vec::with_capacity(selection.proxies.len());
-            let mut colors = Vec::with_capacity(selection.proxies.len());
-            for proxy in selection.proxies {
-                positions.push(proxy.position);
-                normals.push(proxy.normal);
-                colors.push(proxy.color);
-            }
-            let mut proxy_mesh = self.proxy_mesh.borrow_mut();
-            proxy_mesh.set_positions(positions);
-            proxy_mesh.set_normals(normals);
-            proxy_mesh.set_colors(colors);
-            self.pipeline
-                .draw_mesh_with_material(cx, pass, &proxy_mesh, &self.material);
-        }
-
-        for selected in selection.node_lods {
-            if let Some(mesh) = self
-                .node_lods
-                .get(selected.node_lods)
-                .and_then(|lods| lods.get(selected.lod))
-            {
-                self.pipeline
-                    .draw_mesh_with_material(cx, pass, mesh, &self.material);
-            }
-        }
-
-        for leaf_mesh in selection.leaf_meshes {
-            let mesh = match leaf_mesh.lod {
-                Some(lod) => self
-                    .leaf_lods
-                    .get(leaf_mesh.leaf)
-                    .and_then(|lods| lods.get(lod)),
-                None => self.leaf_meshes.get(leaf_mesh.leaf),
-            };
-            if let Some(mesh) = mesh {
-                self.pipeline
-                    .draw_mesh_with_material(cx, pass, mesh, &self.material);
-            }
-        }
-
-        if self.draw_bounds {
-            let (positions, colors) = bounds_lines(&selection.bounds);
-            let mut bounds_mesh = self.bounds_mesh.borrow_mut();
-            bounds_mesh.set_positions(positions);
-            bounds_mesh.set_colors(colors);
-            self.bounds_pipeline.draw_mesh(cx, pass, &bounds_mesh);
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum PcLodBuildError {
     LengthMismatch {
@@ -588,78 +533,6 @@ impl ScreenRect {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Aabb {
-    min: Point3<f32>,
-    max: Point3<f32>,
-}
-
-impl Aabb {
-    fn from_points(points: &[PcLodPoint]) -> Self {
-        let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-        let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for point in points {
-            for axis in 0..3 {
-                min[axis] = min[axis].min(point.position[axis]);
-                max[axis] = max[axis].max(point.position[axis]);
-            }
-        }
-        Self { min, max }
-    }
-
-    fn center(self) -> Point3<f32> {
-        Point3::from_vec((self.min.to_vec() + self.max.to_vec()) * 0.5)
-    }
-
-    fn radius(self) -> f32 {
-        (self.max - self.center()).magnitude()
-    }
-
-    fn corners(self) -> [Point3<f32>; 8] {
-        [
-            Point3::new(self.min.x, self.min.y, self.min.z),
-            Point3::new(self.max.x, self.min.y, self.min.z),
-            Point3::new(self.min.x, self.max.y, self.min.z),
-            Point3::new(self.max.x, self.max.y, self.min.z),
-            Point3::new(self.min.x, self.min.y, self.max.z),
-            Point3::new(self.max.x, self.min.y, self.max.z),
-            Point3::new(self.min.x, self.max.y, self.max.z),
-            Point3::new(self.max.x, self.max.y, self.max.z),
-        ]
-    }
-}
-
-fn representative_point(points: &[PcLodPoint]) -> PcLodPoint {
-    let mut position = Vector3::new(0.0, 0.0, 0.0);
-    let mut normal = Vector3::new(0.0, 0.0, 0.0);
-    let mut color = [0.0; 4];
-    let inv_len = 1.0 / points.len().max(1) as f32;
-
-    for point in points {
-        position += Vector3::new(point.position[0], point.position[1], point.position[2]);
-        normal += Vector3::new(point.normal[0], point.normal[1], point.normal[2]);
-        for (dst, src) in color.iter_mut().zip(point.color) {
-            *dst += src;
-        }
-    }
-
-    position *= inv_len;
-    normal = if normal.magnitude2() > 0.0 {
-        normal.normalize()
-    } else {
-        Vector3::unit_y()
-    };
-    for channel in &mut color {
-        *channel *= inv_len;
-    }
-
-    PcLodPoint {
-        position: position.into(),
-        normal: normal.into(),
-        color,
-    }
-}
-
 fn mesh_from_points(points: Vec<PcLodPoint>) -> Mesh {
     let mut positions = Vec::with_capacity(points.len());
     let mut normals = Vec::with_capacity(points.len());
@@ -673,35 +546,6 @@ fn mesh_from_points(points: Vec<PcLodPoint>) -> Mesh {
     Mesh::new(positions)
         .with_normals(normals)
         .with_colors(colors)
-}
-
-fn leaf_lods_from_points(points: &[PcLodPoint]) -> Vec<Mesh> {
-    point_lods_from_targets(points, &LEAF_LOD_TARGETS, points.len().saturating_sub(1))
-}
-
-fn point_lods_from_targets(
-    points: &[PcLodPoint],
-    targets: &[usize],
-    max_target: usize,
-) -> Vec<Mesh> {
-    let mut lods = Vec::new();
-    let mut last_count = 0usize;
-
-    for target in targets {
-        let target = (*target).min(max_target);
-        if target == 0 || target >= points.len() {
-            break;
-        }
-
-        let sampled = sample_points(points, target);
-        if sampled.len() == last_count || sampled.len() >= points.len() {
-            continue;
-        }
-        last_count = sampled.len();
-        lods.push(mesh_from_points(sampled));
-    }
-
-    lods
 }
 
 fn sample_points(points: &[PcLodPoint], target_count: usize) -> Vec<PcLodPoint> {
@@ -732,59 +576,8 @@ fn dynamic_bounds_mesh() -> Mesh {
     )
 }
 
-fn bounds_lines(bounds: &[(Aabb, PcLodBoundsKind)]) -> (Vec<Position>, Vec<Color>) {
-    let mut positions = Vec::with_capacity(bounds.len() * 24);
-    let mut colors = Vec::with_capacity(bounds.len() * 24);
-
-    for (bounds, kind) in bounds {
-        let color = match kind {
-            PcLodBoundsKind::Proxy => [0.15, 0.95, 1.0, 0.95],
-            PcLodBoundsKind::NodeLod => [1.0, 0.45, 0.0, 0.85],
-            PcLodBoundsKind::Leaf => [1.0, 0.85, 0.10, 0.75],
-        };
-        let corners = bounds.corners();
-        for (a, b) in AABB_EDGES {
-            positions.push(point_to_position(corners[a]));
-            positions.push(point_to_position(corners[b]));
-            colors.push(color);
-            colors.push(color);
-        }
-    }
-
-    (positions, colors)
-}
-
-const AABB_EDGES: [(usize, usize); 12] = [
-    (0, 1),
-    (1, 3),
-    (3, 2),
-    (2, 0),
-    (4, 5),
-    (5, 7),
-    (7, 6),
-    (6, 4),
-    (0, 4),
-    (1, 5),
-    (2, 6),
-    (3, 7),
-];
-
 fn point_to_position(point: Point3<f32>) -> Position {
     [point.x, point.y, point.z]
-}
-
-fn octant(position: Position, center: Point3<f32>) -> usize {
-    let mut index = 0;
-    if position[0] >= center.x {
-        index |= 1;
-    }
-    if position[1] >= center.y {
-        index |= 2;
-    }
-    if position[2] >= center.z {
-        index |= 4;
-    }
-    index
 }
 
 #[cfg(test)]
