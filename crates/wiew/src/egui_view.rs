@@ -201,7 +201,7 @@ impl EguiView3d {
         tex_id: egui::TextureId,
     ) -> egui::Vec2 {
         egui::CentralPanel::default()
-            .show_inside(ui, |ui| self.viewport_interactive(ui, tex_id))
+            .show_inside(ui, |ui| self.viewport_interactive(ui, tex_id).rect.size())
             .inner
     }
 
@@ -210,7 +210,7 @@ impl EguiView3d {
         &mut self,
         ui: &mut egui::Ui,
         tex_id: egui::TextureId,
-    ) -> egui::Vec2 {
+    ) -> egui::Response {
         let avail = ui.available_size();
         let response = ui.add_sized(
             avail,
@@ -243,7 +243,7 @@ impl EguiView3d {
         self.view
             .handle_egui_interaction(primary_active, secondary_active, pointer_pos, scroll_y);
 
-        avail
+        response
     }
 
     // ── Resize ─────────────────────────────────────────────────────────

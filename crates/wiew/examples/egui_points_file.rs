@@ -474,7 +474,7 @@ fn load_points_file(path: &Path) -> Result<LoadedPointCloud, Box<dyn Error>> {
 
 fn ply_file_paths() -> Vec<PathBuf> {
     //["tot.ply", "tot_fiori.ply", "punti_fibbia.ply"]
-    ["tot.ply"]
+    ["punti_fibbia.ply"]
         .into_iter()
         .map(|file| {
             let cwd_path = PathBuf::from(file);
@@ -491,7 +491,7 @@ fn ply_file_paths() -> Vec<PathBuf> {
 
 fn load_ply_points() -> Result<LoadedPointCloudLod, Box<dyn Error>> {
     let (metadata_path, payloads_prefix) = ply_lod_cache_paths();
-    if metadata_path.exists() {
+    if metadata_path.exists() && false {
         let metadata = fs::read(&metadata_path)?;
         let mut lod = PcLod::from_cache_metadata_bytes(&metadata)?;
         for chunk_index in 0.. {

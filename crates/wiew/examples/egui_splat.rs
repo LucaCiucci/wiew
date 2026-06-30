@@ -105,10 +105,10 @@ impl eframe::App for App {
         ui.horizontal(|ui| {
             ui.set_height(view_size.y);
             ui.allocate_ui_with_layout(view_size, egui::Layout::top_down(egui::Align::Min), |ui| {
-                left_desired = self.left_view.viewport_interactive(ui, left_tex_id);
+                left_desired = self.left_view.viewport_interactive(ui, left_tex_id).rect.size();
             });
             ui.allocate_ui_with_layout(view_size, egui::Layout::top_down(egui::Align::Min), |ui| {
-                right_desired = self.right_view.viewport_interactive(ui, right_tex_id);
+                right_desired = self.right_view.viewport_interactive(ui, right_tex_id).rect.size();
             });
         });
 
