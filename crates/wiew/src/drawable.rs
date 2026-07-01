@@ -9,3 +9,7 @@ pub trait Drawable {
     /// [`WCx`] contexts.
     fn draw(&self, cx: &mut WCx, pass: &mut Pass);
 }
+
+impl Drawable for () {
+    fn draw(&self, _cx: &mut WCx, _pass: &mut Pass) {}
+}
