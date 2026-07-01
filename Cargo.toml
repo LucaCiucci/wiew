@@ -2,7 +2,10 @@
 resolver = "3"
 members = [
     "crates/wiew",
-    "crates/wiew-web",
+    #"crates/wiew-web",
+]
+default-members = [
+    "crates/wiew",
 ]
 
 [workspace.package]

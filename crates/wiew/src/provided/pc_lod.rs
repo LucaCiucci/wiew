@@ -487,7 +487,7 @@ impl PcLodSelection {
                     .get(selected.node_lods)
                     .and_then(|node_lods| node_lods.get(selected.lod))
             })
-            .filter_map(|mesh| mesh.positions().len())
+            .filter_map(|mesh| mesh.positions().len_hint())
             .sum();
         self.stats.selected_leaf_chunks = self.leaf_meshes.len();
         self.stats.selected_leaf_lod_chunks = self
@@ -507,7 +507,7 @@ impl PcLodSelection {
                     .and_then(|leaf_lods| leaf_lods.get(lod_index)),
                 None => lod.leaf_meshes.get(leaf.leaf),
             })
-            .filter_map(|mesh| mesh.positions().len())
+            .filter_map(|mesh| mesh.positions().len_hint())
             .sum();
     }
 }

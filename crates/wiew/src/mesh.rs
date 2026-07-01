@@ -203,7 +203,7 @@ impl Mesh {
     }
 
     pub fn vertex_count(&self) -> Option<usize> {
-        self.positions.len()
+        self.positions.len_hint()
     }
 }
 
@@ -215,8 +215,8 @@ pub enum MeshIndices {
 impl MeshIndices {
     pub fn len(&self) -> u32 {
         match self {
-            Self::U16(indices) => indices.len().unwrap_or_default() as u32,
-            Self::U32(indices) => indices.len().unwrap_or_default() as u32,
+            Self::U16(indices) => indices.len_hint().unwrap_or_default() as u32,
+            Self::U32(indices) => indices.len_hint().unwrap_or_default() as u32,
         }
     }
 
@@ -235,12 +235,12 @@ impl MeshIndices {
         match self {
             Self::U16(indices) => BoundMeshIndices {
                 buffer: indices.get(cx),
-                len: indices.len().unwrap_or_default() as u32,
+                len: indices.len_hint().unwrap_or_default() as u32,
                 format: wgpu::IndexFormat::Uint16,
             },
             Self::U32(indices) => BoundMeshIndices {
                 buffer: indices.get(cx),
-                len: indices.len().unwrap_or_default() as u32,
+                len: indices.len_hint().unwrap_or_default() as u32,
                 format: wgpu::IndexFormat::Uint32,
             },
         }
