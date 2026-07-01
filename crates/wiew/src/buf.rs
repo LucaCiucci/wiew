@@ -64,6 +64,26 @@ impl<T: BufElement> Buf<T> {
         self.res.update(descriptor);
     }
 
+    pub fn set_data_arc_vec(&self, data: Arc<Vec<T>>) {
+        let snapshot = self.res.source();
+        let descriptor = BufDescriptor {
+            label: snapshot.label.clone(),
+            usage: snapshot.usage,
+            data: Arc::new(BufSource::ArcVec(data)),
+        };
+        self.res.update(descriptor);
+    }
+
+    pub fn set_data_arc_slice(&self, data: Arc<[T]>) {
+        let snapshot = self.res.source();
+        let descriptor = BufDescriptor {
+            label: snapshot.label.clone(),
+            usage: snapshot.usage,
+            data: Arc::new(BufSource::ArcSlice(data)),
+        };
+        self.res.update(descriptor);
+    }
+
     pub fn set_data_loader(
         &self,
         data: impl Fn() -> anyhow::Result<Vec<T>> + Send + Sync + 'static,
@@ -77,9 +97,12 @@ impl<T: BufElement> Buf<T> {
         self.res.update(descriptor);
     }
 
-    pub fn len(&self) -> Option<usize> {
+    pub fn len_hint(&self) -> Option<usize> {
+        // TODO actually this could be exact if we store the length alongside the loader
         match &*self.res.source().data {
             BufSource::Vec(data) => Some(data.len()),
+            BufSource::ArcVec(data) => Some(data.len()),
+            BufSource::ArcSlice(data) => Some(data.len()),
             BufSource::Loader(_) => None,
         }
     }
@@ -87,12 +110,14 @@ impl<T: BufElement> Buf<T> {
     pub fn to_vec(&self) -> Option<Vec<T>> {
         match &*self.res.source().data {
             BufSource::Vec(data) => Some(data.clone()),
+            BufSource::ArcVec(data) => Some((&**data).to_vec()),
+            BufSource::ArcSlice(data) => Some((&**data).to_vec()),
             BufSource::Loader(_) => None,
         }
     }
 
     pub fn is_empty(&self) -> Option<bool> {
-        self.len().map(|len| len == 0)
+        self.len_hint().map(|len| len == 0)
     }
 
     pub fn get(&self, cx: &mut WCx) -> H<GpuBuffer> {
@@ -104,6 +129,8 @@ impl<T: BufElement> Buf<T> {
                 let data_vec: Vec<T>;
                 let data: &[T] = match &*descriptor.data {
                     BufSource::Vec(vec) => vec.as_slice(),
+                    BufSource::ArcVec(vec) => vec.as_slice(),
+                    BufSource::ArcSlice(slice) => slice.as_ref(),
                     BufSource::Loader(data_provider) => {
                         data_vec = cx.catch_err(data_provider()).unwrap_or_default();
                         data_vec.as_slice()
@@ -170,5 +197,7 @@ struct BufDescriptor<T> {
 
 enum BufSource<T> {
     Vec(Vec<T>),
+    ArcVec(Arc<Vec<T>>),
+    ArcSlice(Arc<[T]>),
     Loader(Box<dyn Fn() -> anyhow::Result<Vec<T>> + Send + Sync>),
 }
