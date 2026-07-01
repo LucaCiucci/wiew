@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell, io::{Cursor, Read}, sync::Mutex,
+    io::{Cursor, Read}, sync::{Mutex, atomic::AtomicBool},
 };
 
 use anyhow::{Context, Result, bail};
@@ -39,7 +39,7 @@ pub(super) struct PcLodPayloadDesc {
     point_count: usize,
     offset: usize,
     byte_len: usize,
-    loaded: Cell<bool>,
+    loaded: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +120,7 @@ impl PcLod {
         for (index, target, mesh) in ready {
             self.apply_payload_mesh(target, mesh);
             if let Some(descriptor) = self.cache_payloads.get(index) {
-                descriptor.loaded.set(true);
+                descriptor.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
         Ok(())
@@ -132,7 +132,7 @@ impl PcLod {
             .context("PcLod payload chunk range overflow")?;
         let mut ready = Vec::new();
         for (index, descriptor) in self.cache_payloads.iter().enumerate() {
-            if descriptor.loaded.get() {
+            if descriptor.loaded.load(std::sync::atomic::Ordering::SeqCst) {
                 continue;
             }
             let descriptor_end = descriptor
@@ -150,7 +150,7 @@ impl PcLod {
         for (index, target, mesh) in ready {
             self.apply_payload_mesh(target, mesh);
             if let Some(descriptor) = self.cache_payloads.get(index) {
-                descriptor.loaded.set(true);
+                descriptor.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
         Ok(())
@@ -201,7 +201,7 @@ impl PcLod {
         if let Some(descriptor) = self
             .cache_payloads
             .iter()
-            .find(|descriptor| descriptor.target == target && !descriptor.loaded.get())
+            .find(|descriptor| descriptor.target == target && !descriptor.loaded.load(std::sync::atomic::Ordering::SeqCst))
         {
             let first = descriptor.offset / PC_LOD_PAYLOAD_CHUNK_SIZE;
             let last = (descriptor.offset + descriptor.byte_len.saturating_sub(1))
@@ -739,7 +739,7 @@ impl<'a> CacheReader<'a> {
             point_count,
             offset,
             byte_len,
-            loaded: Cell::new(false),
+            loaded: AtomicBool::new(false),
         });
         Ok(empty_mesh())
     }
