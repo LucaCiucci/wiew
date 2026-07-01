@@ -5,7 +5,7 @@
 //! choose one of several prebuilt point-count levels from their projected
 //! screen coverage.
 
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{collections::BTreeMap, sync::Mutex};
 
 use cgmath::{EuclideanSpace, InnerSpace, Matrix4, Point3, Vector3, Vector4};
 
@@ -31,6 +31,8 @@ use builder::*;
 use node::*;
 use aabb::*;
 
+// TODO reduce the use of mutexes, maybe just wrapping the fields that need to be mutable in a single struct
+
 /// Hierarchical point-cloud renderer.
 pub struct PcLod {
     config: PcLodConfig,
@@ -41,13 +43,13 @@ pub struct PcLod {
     leaf_lods: Vec<Vec<Mesh>>,
     node_lods: Vec<Vec<Mesh>>,
     cache_payloads: Vec<cache::PcLodPayloadDesc>,
-    requested_cache_payload_chunks: RefCell<BTreeMap<usize, u8>>,
-    proxy_mesh: RefCell<Mesh>,
-    bounds_mesh: RefCell<Mesh>,
+    requested_cache_payload_chunks: Mutex<BTreeMap<usize, u8>>,
+    proxy_mesh: Mutex<Mesh>,
+    bounds_mesh: Mutex<Mesh>,
     pipeline: ColoredSplatPipeline,
     bounds_pipeline: FlatPipeline,
     material: LitMaterial,
-    last_stats: RefCell<PcLodStats>,
+    last_stats: Mutex<PcLodStats>,
     draw_bounds: bool,
 }
 
@@ -76,13 +78,13 @@ impl PcLod {
             leaf_lods: builder.leaf_lods,
             node_lods: builder.node_lods,
             cache_payloads: Vec::new(),
-            requested_cache_payload_chunks: RefCell::new(BTreeMap::new()),
-            proxy_mesh: RefCell::new(dynamic_proxy_mesh()),
-            bounds_mesh: RefCell::new(dynamic_bounds_mesh()),
+            requested_cache_payload_chunks: Mutex::new(BTreeMap::new()),
+            proxy_mesh: Mutex::new(dynamic_proxy_mesh()),
+            bounds_mesh: Mutex::new(dynamic_bounds_mesh()),
             pipeline: ColoredSplatPipeline::new(),
             bounds_pipeline: FlatPipeline::depthless_line_list(),
             material: LitMaterial::leios_blue().with_front_color([1.0, 1.0, 1.0, 1.0]),
-            last_stats: RefCell::new(PcLodStats::default()),
+            last_stats: Mutex::new(PcLodStats::default()),
             draw_bounds: false,
         }
     }
@@ -133,7 +135,7 @@ impl PcLod {
     }
 
     pub fn stats(&self) -> PcLodStats {
-        *self.last_stats.borrow()
+        *self.last_stats.lock().unwrap()
     }
 
     pub fn draw_bounds(&self) -> bool {

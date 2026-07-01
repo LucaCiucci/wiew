@@ -1,6 +1,5 @@
 use std::{
-    cell::Cell,
-    io::{Cursor, Read},
+    cell::Cell, io::{Cursor, Read}, sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
@@ -161,7 +160,7 @@ impl PcLod {
         &self,
         chunk_size: usize,
     ) -> Vec<PcLodPayloadChunkRequest> {
-        let mut requested = self.requested_cache_payload_chunks.borrow_mut();
+        let mut requested = self.requested_cache_payload_chunks.lock().unwrap();
         let mut requests = requested
             .iter()
             .map(|(chunk_index, priority)| (*priority, *chunk_index))
@@ -207,7 +206,7 @@ impl PcLod {
             let first = descriptor.offset / PC_LOD_PAYLOAD_CHUNK_SIZE;
             let last = (descriptor.offset + descriptor.byte_len.saturating_sub(1))
                 / PC_LOD_PAYLOAD_CHUNK_SIZE;
-            let mut requested = self.requested_cache_payload_chunks.borrow_mut();
+            let mut requested = self.requested_cache_payload_chunks.lock().unwrap();
             let priority = payload_priority(target);
             for chunk in first..=last {
                 requested
@@ -376,15 +375,15 @@ impl PcLod {
             leaf_lods,
             node_lods,
             cache_payloads,
-            requested_cache_payload_chunks: std::cell::RefCell::new(
+            requested_cache_payload_chunks: Mutex::new(
                 std::collections::BTreeMap::new(),
             ),
-            proxy_mesh: std::cell::RefCell::new(dynamic_proxy_mesh()),
-            bounds_mesh: std::cell::RefCell::new(dynamic_bounds_mesh()),
+            proxy_mesh: Mutex::new(dynamic_proxy_mesh()),
+            bounds_mesh: Mutex::new(dynamic_bounds_mesh()),
             pipeline: ColoredSplatPipeline::new(),
             bounds_pipeline: FlatPipeline::depthless_line_list(),
             material: LitMaterial::leios_blue().with_front_color([1.0, 1.0, 1.0, 1.0]),
-            last_stats: std::cell::RefCell::new(PcLodStats::default()),
+            last_stats: Mutex::new(PcLodStats::default()),
             draw_bounds: false,
         }
     }

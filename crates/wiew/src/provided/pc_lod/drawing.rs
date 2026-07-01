@@ -4,7 +4,7 @@ impl Drawable for PcLod {
     fn draw(&self, cx: &mut WCx, pass: &mut Pass) {
         let mut selection = self.select(pass);
         selection.finish_stats(self);
-        *self.last_stats.borrow_mut() = selection.stats;
+        *self.last_stats.lock().unwrap() = selection.stats;
 
         if !selection.proxies.is_empty() {
             let mut positions = Vec::with_capacity(selection.proxies.len());
@@ -15,7 +15,7 @@ impl Drawable for PcLod {
                 normals.push(proxy.normal);
                 colors.push(proxy.color);
             }
-            let mut proxy_mesh = self.proxy_mesh.borrow_mut();
+            let mut proxy_mesh = self.proxy_mesh.lock().unwrap();
             proxy_mesh.set_positions(positions);
             proxy_mesh.set_normals(normals);
             proxy_mesh.set_colors(colors);
@@ -50,7 +50,7 @@ impl Drawable for PcLod {
 
         if self.draw_bounds {
             let (positions, colors) = bounds_lines(&selection.bounds);
-            let mut bounds_mesh = self.bounds_mesh.borrow_mut();
+            let mut bounds_mesh = self.bounds_mesh.lock().unwrap();
             bounds_mesh.set_positions(positions);
             bounds_mesh.set_colors(colors);
             self.bounds_pipeline.draw_mesh(cx, pass, &bounds_mesh);
