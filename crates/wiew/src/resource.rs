@@ -19,7 +19,7 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::Display,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use crate::id::new_id_value;
@@ -62,11 +62,19 @@ impl ResourceManager {
             id,
             version,
             source,
+            lifetime,
         } = res.snapshot();
 
         let old_value = {
             let mut inner = self.inner.lock().unwrap();
+            // A resource manager lives for the wgpu context, while scene
+            // resources are usually short lived. Evict GPU values whose
+            // owning `Res` no longer exists before growing the cache.
+            inner
+                .resources
+                .retain(|_, data| data.lifetime.upgrade().is_some());
             let data = inner.resources.entry(id).or_default();
+            data.lifetime = lifetime;
 
             if data.curr_version == version {
                 if let Some(existing) = data.typed_value::<V>() {
@@ -125,6 +133,7 @@ struct ResourceManagerInner {
 struct ResData {
     curr_version: u64,
     curr_value: Option<Arc<dyn Any + Send + Sync>>,
+    lifetime: Weak<()>,
 }
 
 impl ResData {
@@ -158,12 +167,14 @@ impl ResData {
 
 pub struct Res<S: Send + Sync + 'static> {
     inner: Arc<Mutex<ResInner<S>>>,
+    lifetime: Arc<()>,
 }
 
 impl<S: Send + Sync + 'static> Res<S> {
     pub fn new(source: S) -> Self {
         Res {
             inner: Arc::new(Mutex::new(ResInner::new(Arc::new(source)))),
+            lifetime: Arc::new(()),
         }
     }
 
@@ -192,6 +203,7 @@ impl<S: Send + Sync + 'static> Res<S> {
             id: inner.id,
             version: inner.version,
             source: Arc::clone(&inner.source),
+            lifetime: Arc::downgrade(&self.lifetime),
         }
     }
 }
@@ -200,6 +212,7 @@ impl<S: Send + Sync + 'static> Clone for Res<S> {
     fn clone(&self) -> Self {
         Res {
             inner: Arc::clone(&self.inner),
+            lifetime: Arc::clone(&self.lifetime),
         }
     }
 }
@@ -208,6 +221,7 @@ struct ResSnapshot<S> {
     id: ResId,
     version: u64,
     source: Arc<S>,
+    lifetime: Weak<()>,
 }
 
 struct ResInner<S> {
@@ -253,8 +267,8 @@ impl Display for ResId {
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
 
     type TextResource = Res<String>;
@@ -337,5 +351,21 @@ mod tests {
         });
 
         assert_eq!(&*value, "outer-42");
+    }
+
+    #[test]
+    fn evicts_cached_values_after_their_resource_is_dropped() {
+        let manager = ResourceManager::new();
+        {
+            let stale = TextResource::new("stale".to_owned());
+            let value = manager.get_or_instantiate_with(&stale, |_, _| "value".to_owned());
+            drop(value);
+        }
+
+        let live = TextResource::new("live".to_owned());
+        let value = manager.get_or_instantiate_with(&live, |_, _| "value".to_owned());
+        drop(value);
+
+        assert_eq!(manager.inner.lock().unwrap().resources.len(), 1);
     }
 }
